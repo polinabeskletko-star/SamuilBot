@@ -29,6 +29,14 @@ TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID")       # string chat id
 
 TARGET_USER_ID = int(TARGET_USER_ID_ENV) if TARGET_USER_ID_ENV else None
 
+# Second user: поддержка и усиление (по умолчанию 502791142)
+SUPPORT_USER_ID_ENV = os.environ.get("SUPPORT_USER_ID")
+SUPPORT_USER_ID = (
+    int(SUPPORT_USER_ID_ENV)
+    if SUPPORT_USER_ID_ENV
+    else 502791142  # твой запрошенный ID по умолчанию
+)
+
 # OpenAI
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 client = OpenAI()  # API key берётся из OPENAI_API_KEY
@@ -104,13 +112,27 @@ def build_hourly_prompt(now: datetime) -> str:
 def build_sarcastic_prompt(user_text: str) -> str:
     """Prompt для саркастического ответа на сообщение Максима."""
     return (
-        "Ты язвительный, но доброжелательный друг Максима в телеграм-чате. "
-        "Ответь на его сообщение короткой шутливой фразой по-русски. "
+        "Ты язвительный, но доброжелательный друг в телеграм-чате. "
+        "Ответь на сообщение короткой шутливой фразой по-русски. "
         "Стиль: лёгкий сарказм, без оскорблений, без мата, максимум 25 слов. "
         "Не используй смайлики и хэштеги. "
-        "Сообщение Максима:\n\n"
+        "Сообщение пользователя:\n\n"
         f"{user_text}\n\n"
         "Теперь придумай один подходящий саркастический ответ. Только ответ, без пояснений."
+    )
+
+
+def build_supportive_prompt(user_text: str) -> str:
+    """Prompt для поддерживающего/усиливающего ответа на сообщение второго пользователя."""
+    return (
+        "Ты очень поддерживающий и воодушевляющий друг в телеграм-чате. "
+        "Ответь на сообщение короткой фразой по-русски, которая поддерживает, "
+        "усиливает и хвалит собеседника. "
+        "Стиль: тёплый, мотивирующий, без пафоса, максимум 25 слов. "
+        "Не используй смайлики и хэштеги. "
+        "Сообщение пользователя:\n\n"
+        f"{user_text}\n\n"
+        "Теперь придумай один подходящий поддерживающий ответ. Только ответ, без пояснений."
     )
 
 
@@ -143,16 +165,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type == "private":
         await update.message.reply_text(
             "Привет! Я Друг Максима 🤖\n"
-            "В группе я каждый час в :15 буду спрашивать:\n"
-            "как у Максима дела и чем он занимается.\n"
-            "Формулировки будут разными и зависят от времени суток.\n"
-            "Ночью с 22:00 до 9:00 я молчу 😴"
+            "В группе я каждый час в :15 буду спрашивать, как у Максима дела,\n"
+            "формулировки будут разными и зависят от времени суток.\n"
+            "Ночью с 22:00 до 9:00 я молчу 😴\n"
+            "А ещё я отвечаю Максиму с лёгким сарказмом и поддерживаю другого выбранного пользователя."
         )
     else:
         await update.message.reply_text(
-            "Я отправляю вопрос Максиму каждый час в :15, "
-            "с разными формулировками в зависимости от времени суток, "
-            "кроме ночи с 22:00 до 9:00."
+            "Я отправляю вопрос Максиму каждый час в :15 с разными формулировками, "
+            "кроме ночи с 22:00 до 9:00. "
+            "Также шучу над одним пользователем и поддерживаю другого 😊"
         )
 
 
@@ -166,7 +188,7 @@ async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return user id for testing TARGET_USER_ID."""
+    """Return user id for testing TARGET_USER_ID / SUPPORT_USER_ID."""
     user = update.effective_user
     if not user:
         return
@@ -176,7 +198,7 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def echo_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Simple echo reply ONLY in private chats.
-    In groups the bot stays quiet (except scheduled messages + target jokes).
+    In groups the bot stays quiet (except scheduled messages + target jokes/support).
     """
     if update.effective_chat.type != "private":
         return
@@ -185,12 +207,14 @@ async def echo_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ты написал: {text}")
 
 
-# ================== GROUP MESSAGE HANDLER (JOKES) ==================
+# ================== GROUP MESSAGE HANDLER (JOKES & SUPPORT) ==================
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатываем сообщения в группах.
-    Если сообщение от TARGET_USER_ID в TARGET_CHAT_ID – отвечаем сарказмом через OpenAI.
+    Если сообщение от TARGET_USER_ID в TARGET_CHAT_ID – сарказм через OpenAI.
+    Если сообщение от SUPPORT_USER_ID – поддерживающий ответ через OpenAI.
+    Остальные пользователи игнорируются.
     """
     message = update.message
     if not message:
@@ -213,28 +237,45 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if TARGET_CHAT_ID and chat_id_str != TARGET_CHAT_ID:
         return
 
-    # Если не задан TARGET_USER_ID – ничего не делаем
-    if TARGET_USER_ID is None:
+    if user_id is None:
         return
 
-    # Реагируем только на сообщения целевого пользователя
-    if user_id != TARGET_USER_ID:
+    # ----- Ветка 1: сарказм для TARGET_USER_ID -----
+    if TARGET_USER_ID is not None and user_id == TARGET_USER_ID:
+        print(
+            f"TARGET (sarcastic) MESSAGE: from user {user_id} in chat {chat.id}: '{text}'"
+        )
+
+        prompt = build_sarcastic_prompt(text)
+        fallback = "Интересно, это ты сейчас серьёзно или опять шутишь?"
+        reply_text = generate_ai_text(prompt, fallback)
+
+        try:
+            await message.reply_text(reply_text)
+            print("Sarcastic reply sent.")
+        except Exception as e:
+            print("Error sending sarcastic reply:", e)
         return
 
-    print(
-        f"TARGET MESSAGE: from user {user_id} in chat {chat.id}: '{text}'"
-    )
+    # ----- Ветка 2: поддержка для SUPPORT_USER_ID -----
+    if SUPPORT_USER_ID is not None and user_id == SUPPORT_USER_ID:
+        print(
+            f"SUPPORT (encouraging) MESSAGE: from user {user_id} in chat {chat.id}: '{text}'"
+        )
 
-    # Строим prompt и вызываем OpenAI
-    prompt = build_sarcastic_prompt(text)
-    fallback = "Интересно, Максим, это ты серьёзно сейчас или опять шутишь?"
-    reply_text = generate_ai_text(prompt, fallback)
+        prompt = build_supportive_prompt(text)
+        fallback = "Звучит очень круто, продолжай в том же духе, это реально впечатляет!"
+        reply_text = generate_ai_text(prompt, fallback)
 
-    try:
-        await message.reply_text(reply_text)
-        print("Sarcastic reply sent.")
-    except Exception as e:
-        print("Error sending sarcastic reply:", e)
+        try:
+            await message.reply_text(reply_text)
+            print("Supportive reply sent.")
+        except Exception as e:
+            print("Error sending supportive reply:", e)
+        return
+
+    # Остальные пользователи — игнор
+    return
 
 
 # ================== SCHEDULED HOURLY MESSAGE ==================
@@ -295,7 +336,7 @@ def main():
         )
     )
 
-    # Group messages (for sarcastic replies)
+    # Group messages (for sarcastic + supportive replies)
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
@@ -321,7 +362,12 @@ def main():
         first=first_run,
     )
 
-    print("Bot started and hourly AI job scheduled...")
+    print(
+        "Bot started and hourly AI job scheduled...\n"
+        f"TARGET_USER_ID (sarcasm): {TARGET_USER_ID}, "
+        f"SUPPORT_USER_ID (support): {SUPPORT_USER_ID}, "
+        f"TARGET_CHAT_ID: {TARGET_CHAT_ID}"
+    )
     app.run_polling()
 
 
