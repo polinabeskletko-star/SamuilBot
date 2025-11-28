@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 from datetime import datetime, timedelta
 
 import pytz
@@ -55,50 +56,58 @@ def is_night_time(dt: datetime) -> bool:
     return hour >= 22 or hour < 9
 
 
+# ---------- OPENAI JOKES ----------
+
+FALLBACK_JOKES = [
+    "Максим, я даже не знаю, что сказать… Ты сам понял, что написал? 😏",
+    "Максим, опять текст уровня «гугл потом разберёт»? 😂",
+    "Максим, это было задумано так или просто палец промахнулся по клавиатуре? 😉",
+    "Читаю и думаю: это шедевр или черновик, который случайно отправился? 😄",
+    "Максим, я сохранил это сообщение в папку «странные, но гениальные идеи». Ну или просто странные. 🤔",
+]
+
+
 async def call_openai_sarcastic_joke(user_text: str) -> str:
     """
-    Call OpenAI to produce a short sarcastic reply in Russian,
-    teasing the user gently based on their last message.
-    Fallback to a static line if something goes wrong.
+    Call OpenAI to produce a short sarcastic reply in Russian.
+    If OpenAI недоступен – берём случайную шутку из FALLBACK_JOKES.
     """
+    # Если ключа нет – сразу рандомная шутка
     if not client or not OPENAI_API_KEY:
-        # Fallback if no key configured
-        return "Конечно, Максим, опять что-то гениальное написал, да? 😉"
+        print("OpenAI client is not configured, using local fallback joke.")
+        return random.choice(FALLBACK_JOKES)
 
-    prompt = f"""
-Ты язвительный, но добрый друг Максима. 
-Тебе написали в чате следующее сообщение:
+    system_prompt = (
+        "Ты язвительный, но добрый друг Максима. "
+        "Отвечаешь коротко на русском (до 25 слов), с лёгким стёбом, "
+        "но не грубо и не обидно. Можно 1–2 смайлика, не больше."
+    )
 
-\"\"\"{user_text}\"\"\"
-
-Ответь одной короткой репликой (до 25 слов) на русском языке.
-Саркастично, с лёгким стёбом, но не грубо и не обидно.
-Без смайликов в начале, максимум 1–2 смайлика внутри или в конце.
-"""
+    user_prompt = (
+        "В чате написали такое сообщение. Придумай одну короткую саркастичную реплику.\n\n"
+        f"Сообщение: \"{user_text}\""
+    )
 
     try:
-        # Blocking call inside async – OK for our simple use case.
-        response = client.responses.create(
+        response = client.chat.completions.create(
             model="gpt-4.1-mini",
-            input=prompt,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=80,
+            temperature=0.9,
         )
 
-        # Extract text
-        text = ""
-        for item in response.output:
-            if hasattr(item, "content"):
-                for part in item.content:
-                    if part.type == "output_text":
-                        text += part.text
+        reply = response.choices[0].message.content.strip()
+        if not reply:
+            raise ValueError("Empty reply from OpenAI")
 
-        text = text.strip()
-        if not text:
-            raise ValueError("Empty response from OpenAI")
+        return reply
 
-        return text
     except Exception as e:
-        print("Error calling OpenAI:", e)
-        return "Максим, я даже не знаю, что сказать… Ты сам понял, что написал? 😏"
+        print("Error calling OpenAI, using fallback joke:", e)
+        return random.choice(FALLBACK_JOKES)
 
 
 # ---------- DEBUG LOGGER ----------
@@ -106,7 +115,6 @@ async def call_openai_sarcastic_joke(user_text: str) -> str:
 async def debug_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Logs every update that reaches the bot.
-    This is only for debugging to see what Telegram actually sends.
     """
     chat = update.effective_chat
     user = update.effective_user
@@ -119,6 +127,7 @@ async def debug_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"user_id={user.id if user else None}",
         f"user_name={user.username if user else None}",
         f"text={repr(msg.text) if msg and msg.text else None}",
+        flush=True,
     )
 
 
@@ -154,12 +163,14 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не могу определить тебя 🤷‍♂️")
         return
 
-    await update.message.reply_text(
+    text = (
         f"Твой user ID: `{user.id}`\n"
-        f"Имя: {user.first_name or ''} {user.last_name or ''}\n"
-        f"Username: @{user.username}" if user.username else "",
-        parse_mode="Markdown",
+        f"Имя: {user.first_name or ''} {user.last_name or ''}"
     )
+    if user.username:
+        text += f"\nUsername: @{user.username}"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ---------- ECHO FOR PRIVATE CHATS ----------
@@ -186,27 +197,25 @@ async def target_user_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if TARGET_USER_ID is None:
-        # Nothing to track
         return
 
     if not user or user.id != TARGET_USER_ID:
-        # Not our target user
         return
 
-    # At this point, message is from target user in group → generate sarcastic reply
     user_text = msg.text.strip()
     if not user_text:
         return
 
     print(
-        f"TARGET MESSAGE: from user {user.id} in chat {chat.id}: {repr(user_text)}"
+        f"TARGET MESSAGE: from user {user.id} in chat {chat.id}: {repr(user_text)}",
+        flush=True,
     )
 
     reply_text = await call_openai_sarcastic_joke(user_text)
 
     try:
         await msg.reply_text(reply_text)
-        print("Sarcastic reply sent.")
+        print("Sarcastic reply sent.", flush=True)
     except Exception as e:
         print("Error sending sarcastic reply:", e)
 
@@ -232,7 +241,7 @@ async def hourly_message(context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id_int,
             text="Максим, как у тебя дела? Чем занимаешься?"
         )
-        print(f"{now} – hourly message sent to chat {chat_id_int}")
+        print(f"{now} – hourly message sent to chat {chat_id_int}", flush=True)
     except Exception as e:
         print("Error sending hourly message:", e)
 
@@ -245,7 +254,7 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # DEBUG LOGGER – will log every update that reaches the bot
+    # DEBUG LOGGER – logs every update
     app.add_handler(MessageHandler(filters.ALL, debug_logger), group=0)
 
     # Commands
@@ -291,7 +300,7 @@ def main():
     )
 
     print("Bot started and hourly job scheduled...", flush=True)
-    app.run_polling(allowed_updates=None)  # receive all update types
+    app.run_polling(allowed_updates=None)
 
 
 if __name__ == "__main__":
