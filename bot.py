@@ -32,8 +32,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 
 # OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-# Для веб-поиска сюда можно поставить, например: gpt-4o-mini-browsing
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini-browsing")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY:
@@ -72,59 +71,31 @@ async def log_to_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
             print("Failed to send admin log:", e)
 
 
-def _messages_to_responses_input(
-    messages: List[Dict[str, str]]
-) -> List[Dict[str, Any]]:
-    """
-    Конвертация списка сообщений с полями role/content
-    в формат input для client.responses.create.
-    """
-    converted: List[Dict[str, Any]] = []
-    for m in messages:
-        converted.append(
-            {
-                "role": m["role"],
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": m["content"],
-                    }
-                ],
-            }
-        )
-    return converted
-
-
-async def call_openai_responses(
+async def call_openai_chat(
     messages: List[Dict[str, str]],
     max_tokens: int = 120,
     temperature: float = 0.7,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    Универсальная обёртка над OpenAI Responses API.
-    Принимает список messages (role/content) и вызывает client.responses.create.
+    Универсальная обёртка над OpenAI chat.completions.
+    Принимает уже готовый список messages.
     Возвращает (text, error_message).
     """
     if client is None:
         return None, "OpenAI client is not configured (no API key)."
 
     try:
-        input_payload = _messages_to_responses_input(messages)
-
         resp = await asyncio.to_thread(
-            client.responses.create,
+            client.chat.completions.create,
             model=OPENAI_MODEL,
-            input=input_payload,
+            messages=messages,
+            max_tokens=max_tokens,
             temperature=temperature,
-            max_output_tokens=max_tokens,
         )
-        # Согласно новым докам, есть удобное свойство output_text
-        text = (resp.output_text or "").strip()
-        if not text:
-            return None, "Empty response from OpenAI"
+        text = resp.choices[0].message.content.strip()
         return text, None
     except Exception as e:
-        err = f"Error calling OpenAI Responses API: {e}"
+        err = f"Error calling OpenAI: {e}"
         print(err)
         return None, err
 
@@ -250,10 +221,7 @@ def build_samuil_system_prompt(include_maxim_context: bool) -> str:
     return base
 
 
-async def generate_sarcastic_reply_for_maxim(
-    now: datetime,
-    user_text: str
-) -> Tuple[Optional[str], Optional[str]]:
+async def generate_sarcastic_reply_for_maxim(now: datetime, user_text: str) -> Tuple[Optional[str], Optional[str]]:
     weekday = now.weekday()
     weekday_names = [
         "понедельник", "вторник", "среда",
@@ -275,7 +243,7 @@ async def generate_sarcastic_reply_for_maxim(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    return await call_openai_responses(messages, max_tokens=80, temperature=0.9)
+    return await call_openai_chat(messages, max_tokens=80, temperature=0.9)
 
 
 async def generate_samuil_answer(
@@ -306,7 +274,7 @@ async def generate_samuil_answer(
 
     extra_context_parts = [
         f"Сегодня {weekday_name}, время {time_str}.",
-        "Ты находишься в групповом чате и отвечаешь только когда к тебе обращаются по имени «Самуил».",
+        "Ты находишься в групповом чате и отвечаешь только когда к тебе обращаются по имени «Самуил»."
     ]
     if weather_info is not None:
         weather_str = format_weather_for_prompt(weather_info)
@@ -333,11 +301,7 @@ async def generate_samuil_answer(
     # Текущее сообщение пользователя
     messages.append({"role": "user", "content": user_text})
 
-    text, err = await call_openai_responses(
-        messages,
-        max_tokens=MAX_QA_TOKENS,
-        temperature=0.8,
-    )
+    text, err = await call_openai_chat(messages, max_tokens=MAX_QA_TOKENS, temperature=0.8)
     if text is not None:
         # Обновляем историю: добавляем и вопрос, и ответ
         history.append({"role": "user", "content": user_text})
@@ -507,7 +471,7 @@ async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    text, err = await call_openai_responses(messages, max_tokens=200, temperature=0.9)
+    text, err = await call_openai_chat(messages, max_tokens=200, temperature=0.9)
     if text is None:
         print(f"OpenAI error for evening summary: {err}")
         return
@@ -545,7 +509,7 @@ async def good_night_job(context: ContextTypes.DEFAULT_TYPE):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    text, err = await call_openai_responses(messages, max_tokens=120, temperature=0.8)
+    text, err = await call_openai_chat(messages, max_tokens=120, temperature=0.8)
     if text is None:
         print(f"OpenAI error for good night: {err}")
         return
@@ -609,7 +573,7 @@ def main():
     # Пожелание спокойной ночи в 21:00 каждый день
     job_queue.run_daily(
         good_night_job,
-        time=time(21, 0, tzinfo=tz),
+        time=time(21, 00, tzinfo=tz),
         name="good_night_job",
     )
 
