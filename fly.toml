@@ -1,0 +1,15 @@
+app = "<your-app-name-here>"
+primary_region = "syd"  # or another region Fly gave you
+
+[build]
+  # we use Dockerfile, so no special config here
+
+[env]
+  # optional: non-secret env vars, leave empty for now
+
+[processes]
+  app = "python bot.py"
+
+[vm]
+  size = "shared-cpu-1x"
+  memory = "256mb"
