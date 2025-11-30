@@ -2,7 +2,7 @@ import os
 import random
 import asyncio
 from datetime import datetime, date, time as dtime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import pytz
 import httpx
@@ -172,21 +172,29 @@ async def call_openai(
     user_prompt: str,
     max_tokens: int = 120,
     temperature: float = 0.7,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Обёртка над OpenAI. Возвращает (text, error_message).
+
+    history: список сообщений вида {"role": "user"/"assistant", "content": "..."}
+    который добавляется перед текущим user_prompt (используется для Самуила).
     """
     if client is None:
         return None, "OpenAI client is not configured (no API key)."
 
     try:
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_prompt})
+
         resp = await asyncio.to_thread(
             client.chat.completions.create,
             model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
         )
@@ -204,6 +212,7 @@ async def generate_message_for_kind(
     user_text: Optional[str] = None,
     daily_messages: Optional[list] = None,
     weather_brisbane: Optional[dict] = None,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     kind:
@@ -324,7 +333,7 @@ async def generate_message_for_kind(
     # --- Сравнение погоды Бризбен / Калуга ---
     if kind == "weather_compare":
         # Здесь сам текст уже формируется через format_weather_compare,
-        # поэтому просто вернём его как есть.
+        # поэтому просто вернём код ошибки, чтобы не использовать этот путь.
         return None, "weather_compare_should_be_built_outside"
 
     # --- Спокойной ночи ---
@@ -342,24 +351,30 @@ async def generate_message_for_kind(
         )
         return await call_openai(system_prompt, user_prompt, max_tokens=80, temperature=0.8)
 
-    # --- Q&A по имени 'Самуил' ---
+    # --- Q&A по имени 'Самуил' с учётом истории ---
     if kind == "samuil_qa":
         system_prompt = (
             "Ты умный, остроумный и слегка саркастичный помощник по имени 'Самуил'. "
             "Ты отвечаешь на вопросы пользователей в Telegram-чате. "
             "Пиши по-русски, на 'ты', давай полезные и по возможности точные ответы. "
             "Можешь немного подшучивать, но не будь откровенно грубым. "
-            "Отвечай по сути вопроса, не пересказывай, что тебя упомянули по имени."
+            "Отвечай по сути вопроса. "
+            "История переписки, которая идёт перед последним сообщением, — это ваш контекст разговора."
         )
         user_prompt = (
             f"Сегодня {weekday_name}, время {time_str}. "
-            f"Пользователь написал в чат сообщение, где упомянул тебя по имени 'Самуил':\n"
+            f"Новое сообщение пользователя в чате, где упомянули тебя по имени:\n"
             f"«{user_text}».\n\n"
-            "Считай это вопросом к тебе. Ответь развёрнуто, но не слишком длинно "
-            "(2–5 предложений), по сути вопроса. Если вопрос непонятный, попроси "
-            "уточнить, но всё равно попробуй что-то подсказать. Не упоминай системные детали."
+            "Считай это продолжением разговора и ответь по сути. "
+            "2–5 предложений, не слишком длинно."
         )
-        return await call_openai(system_prompt, user_prompt, max_tokens=220, temperature=0.8)
+        return await call_openai(
+            system_prompt,
+            user_prompt,
+            max_tokens=220,
+            temperature=0.8,
+            history=history,
+        )
 
     return None, "Unknown message kind"
 
@@ -376,7 +391,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• По выходным несколько раз в день напоминаю о себе сообщениями с вопросом и шутками.\n"
             "• В 20:30 даю саркастичный обзор дня.\n"
             "• В 21:00 желаю спокойной ночи.\n"
-            "• Если в сообщении есть слово «Самуил» — считаю это вопросом и отвечаю как мини-ChatGPT.\n"
+            "• Если в сообщении есть слово «Самуил» — считаю это вопросом и отвечаю как мини-ChatGPT с памятью.\n"
             "Ночью с 22:00 до 7:00 я молчу 😴"
         )
     else:
@@ -386,7 +401,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Добавляю поддержку Максиму, когда его поддерживает Сергей,\n"
             "• Пишу регулярные сообщения с учётом погоды,\n"
             "• Делаю вечерний обзор дня и желаю спокойной ночи,\n"
-            "• И отвечаю на вопросы, где есть слово «Самуил»."
+            "• И отвечаю на вопросы, где есть слово «Самуил», помня контекст беседы."
         )
 
 
@@ -444,12 +459,16 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Копим сообщения для вечернего анализа (простая реализация в памяти)
     today_str = date.today().isoformat()
     bot_data = context.bot_data
-    key = f"daily_messages_{today_str}"
-    msgs_list = bot_data.get(key, [])
+    key_daily = f"daily_messages_{today_str}"
+    msgs_list = bot_data.get(key_daily, [])
     msgs_list.append(f"{user.username or user.full_name}: {text}")
-    bot_data[key] = msgs_list
+    bot_data[key_daily] = msgs_list
 
     text_lower = text.lower()
+
+    # Ключ для истории диалога с Самуилом в этом чате
+    history_key = f"samuil_history_{chat_id}"
+    history: List[Dict[str, str]] = bot_data.get(history_key, [])
 
     # --- 1) Вопрос к Самуилу по ключевому слову (имеет приоритет над остальным) ---
     if "самуил" in text_lower:
@@ -457,12 +476,23 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             "samuil_qa",
             now=now,
             user_text=text,
+            history=history,
         )
         if ai_text is None:
             fallback = "Я услышал, что ты меня звал, но у меня сейчас экзистенциальный тайм-аут."
             print(f"OpenAI error for samuil_qa: {err}")
             await message.chat.send_message(fallback)
             return
+
+        # Обновляем историю: добавляем реплику пользователя и ответ Самуила
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": ai_text})
+
+        # Ограничиваем историю, чтобы не раздувалась бесконечно
+        if len(history) > 20:
+            history = history[-20:]
+
+        bot_data[history_key] = history
 
         await message.chat.send_message(ai_text)
         return
@@ -508,7 +538,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def weekend_regular_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Раз в 3 часа по выходным — сообщение Максиму с упоминанием погоды.
+    Раз в заданное время по выходным — сообщение Максиму с упоминанием погоды.
     """
     if not GROUP_CHAT_ID:
         return
@@ -734,7 +764,7 @@ def main():
         name="weekday_morning_job",
     )
 
-    # 2) Выходные: сообщения каждые 3 часа (примерно) — пускай в 9, 12, 15, 18
+    # 2) Выходные: сообщения несколько раз в день — в 9, 12, 15, 18
     for hour in (9, 12, 15, 18):
         job_queue.run_daily(
             weekend_regular_job,
