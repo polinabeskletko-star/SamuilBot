@@ -438,7 +438,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     return
 
 
-# ---------- SCHEDULED JOBS (минимально, оставляем только вечерний обзор) ----------
+# ---------- SCHEDULED JOBS ----------
 
 async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -486,6 +486,44 @@ async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
         print("Error sending evening summary message:", e)
 
 
+async def good_night_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    В 21:00 желает Максиму спокойной ночи и приятных снов.
+    Тон — фирменный: доброжелательный, но с лёгким сарказмом.
+    """
+    if not GROUP_CHAT_ID:
+        return
+
+    tz = get_tz()
+    now = datetime.now(tz)
+
+    system_prompt = build_samuil_system_prompt(include_maxim_context=True)
+    user_prompt = (
+        "Сделай короткое (1–3 предложения) пожелание спокойной ночи и приятных снов Максиму "
+        "от имени Самуила. Можно мягко подколоть его одинокие вечера, поиски «лесной нимфы» "
+        "или то, что он опять задумается о своей гениальности перед сном. "
+        "Но общее ощущение должно быть тёплым и поддерживающим."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    text, err = await call_openai_chat(messages, max_tokens=120, temperature=0.8)
+    if text is None:
+        print(f"OpenAI error for good night: {err}")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(GROUP_CHAT_ID),
+            text=text,
+        )
+        print(f"[Good night] Sent at {now}")
+    except Exception as e:
+        print("Error sending good night message:", e)
+
+
 # ---------- MAIN APP ----------
 
 def main():
@@ -522,7 +560,7 @@ def main():
 
     print(
         f"Local time now: {now} [{TIMEZONE}]. "
-        "Scheduling evening summary job."
+        "Scheduling evening summary and good night jobs."
     )
 
     # Вечерний саркастический обзор в 20:30 каждый день
@@ -530,6 +568,13 @@ def main():
         evening_summary_job,
         time=time(20, 30, tzinfo=tz),
         name="evening_summary_job",
+    )
+
+    # Пожелание спокойной ночи в 21:00 каждый день
+    job_queue.run_daily(
+        good_night_job,
+        time=time(21, 50, tzinfo=tz),
+        name="good_night_job",
     )
 
     print("Bot started and jobs scheduled...")
