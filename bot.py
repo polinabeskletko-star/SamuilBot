@@ -404,22 +404,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.chat.send_message(ai_text)
         return
 
-    # --- 4. Сообщения Сергея — дополнительная поддержка Максима,
-    #      но только если там упомянут Максим ---
-    if SUPPORT_USER_ID and user_id == SUPPORT_USER_ID and (
-        "максим" in lower_text or "maxim" in lower_text
-    ):
-        ai_text, err = await generate_message_for_kind(
-            "support_for_maxim", now=now, user_text=text
-        )
-        if ai_text is None:
-            fallback = "Максим, кажется, вселенная сегодня явно за тебя."
-            print(f"OpenAI error for support_for_maxim: {err}")
-            await message.chat.send_message(fallback)
-            return
-
-        await message.chat.send_message(ai_text)
-        return
 
     # Остальные пользователи — бот молчит (в группе)
     return
