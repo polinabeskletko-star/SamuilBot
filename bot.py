@@ -91,7 +91,6 @@ SYSTEM_PROMPT_SAMUIL = f"""
 
 # ==== ПАМЯТЬ КОНТЕКСТА ====
 
-# Увеличим историю, чтобы было что анализировать вечером
 MAX_HISTORY = 50
 dialog_history: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
@@ -172,7 +171,7 @@ async def ask_openai(prompt: str, history_key: str, from_maxim: bool) -> str:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.9,  # чуть больше рандома и дерзости
+            temperature=0.9,
             max_tokens=300,
         )
         answer = resp.choices[0].message.content.strip()
@@ -232,7 +231,6 @@ def get_today_conversation_excerpt(tz: pytz.timezone) -> Optional[str]:
     чтобы вечером сделать по нему мини-анализ.
     Берём историю из основного чата (GROUP_CHAT_ID) или лички с Максимом.
     """
-    # Ключ истории такой же, как в handle_message: f"{chat.id}"
     main_key = None
     if GROUP_CHAT_ID:
         main_key = GROUP_CHAT_ID
@@ -251,7 +249,6 @@ def get_today_conversation_excerpt(tz: pytz.timezone) -> Optional[str]:
 
     for h in history:
         ts_str = h.get("ts")
-        # Если таймстампа нет — считаем, что можно включать (на случай старых записей)
         include = True
         if ts_str:
             try:
@@ -260,7 +257,6 @@ def get_today_conversation_excerpt(tz: pytz.timezone) -> Optional[str]:
                 if dt_local.date() != today:
                     include = False
             except Exception:
-                # если не смогли распарсить — просто включим
                 include = True
 
         if not include:
@@ -269,11 +265,9 @@ def get_today_conversation_excerpt(tz: pytz.timezone) -> Optional[str]:
         role = h.get("role")
         content = h.get("content", "")
 
-        # Пропускаем системные штуки
         if role == "system":
             continue
 
-        # Слегка чистим содержимое (чтобы не было видно префиксов целиком)
         if "Сообщение от Максима:" in content:
             label = "Максим"
             text = content.replace("Сообщение от Максима:", "").strip()
@@ -292,15 +286,21 @@ def get_today_conversation_excerpt(tz: pytz.timezone) -> Optional[str]:
     if not lines:
         return None
 
-    # Ограничим длину, чтобы не перегружать промт
-    excerpt = "\n".join(lines[-30:])  # последние ~30 реплик
+    excerpt = "\n".join(lines[-30:])
     return excerpt
 
 
 # ==== ХЕНДЛЕРЫ ТЕЛЕГРАМА ====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Привет. Я Самуил. Буду иногда портить Максиму жизнь своими комментариями.")
+    """Старт — тоже отдельным сообщением, не reply."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text="Привет. Я Самуил. Буду иногда портить Максиму жизнь своими комментариями.",
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -333,9 +333,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not addressed and not replied_to_bot:
                 return  # игнорируем фон
 
-    # В личке — отвечаем всегда
     reply = await ask_openai(text, history_key, from_max)
-    await msg.reply_text(reply)
+
+    # Отправляем как отдельное сообщение, не reply
+    await context.bot.send_message(chat_id=chat.id, text=reply)
 
 
 # ==== ПЛАНОВЫЕ СООБЩЕНИЯ ДЛЯ МАКСИМА ====
@@ -376,7 +377,6 @@ async def send_evening_message(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     last_scheduled_run["evening"] = today
 
-    # Собираем фрагмент сегодняшней переписки
     excerpt = get_today_conversation_excerpt(tz)
 
     if excerpt:
