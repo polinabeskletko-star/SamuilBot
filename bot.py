@@ -2,8 +2,8 @@ import os
 import re
 import random
 import asyncio
-from datetime import datetime, time, date
-from collections import defaultdict
+from datetime import datetime, time, date, timedelta
+from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional, Any
 
 import pytz
@@ -51,8 +51,17 @@ dialog_history: Dict[Tuple[int, int], List[Dict[str, str]]] = defaultdict(list)
 # Логи сообщений для вечернего анализа: date_str -> list[str]
 daily_summary_log: Dict[str, List[str]] = defaultdict(list)
 
-# Флаг для отслеживания, были ли уже добавлены задачи
+# Флаг для отслеживания, были ли уже добавлены задачи (в рамках процесса)
 _jobs_scheduled = False
+
+# Дедуп отправки плановых сообщений (в рамках процесса)
+# job_name -> datetime last_sent_at (tz-aware)
+_last_scheduled_sent_at: Dict[str, datetime] = {}
+# job_name -> deque последних текстов
+_last_scheduled_texts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
+
+# Для разнообразия ответов Максиму: хранить последние ответы
+_last_maxim_replies: deque = deque(maxlen=8)
 
 
 # ---------- HELPERS ----------
@@ -96,7 +105,9 @@ async def call_openai_chat(
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        text = resp.choices[0].message.content.strip()
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            return None, "Empty response from OpenAI."
         return text, None
     except Exception as e:
         err = f"Error calling OpenAI: {e}"
@@ -223,111 +234,85 @@ def format_weather_for_prompt(info: Dict[str, Any]) -> str:
 
 # ---------- AI MESSAGE GENERATORS ----------
 
-MAX_QA_TOKENS = 300  # ограничение длины ответа Самуила на вопросы
+# Сократили лимиты, чтобы ответы стали короче
+MAX_QA_TOKENS = 160  # ответы Самуила при прямом обращении
+MAX_MAXIM_REPLY_TOKENS = 70  # ответы на Максима (коротко)
 
 def get_time_context(time_str: str, hour: int) -> str:
     """Генерирует контекстное описание времени для промптов."""
     if hour < 6:
-        return "Ночь, пора бы спать, но кому-то, видимо, не спится."
+        return "Ночь."
     elif hour < 12:
-        return "Утро. Время, когда гении обычно особенно продуктивны... или нет?"
+        return "Утро."
     elif hour < 17:
-        return "День в разгаре. Идеальное время для важных дел... или для размышлений о жизни."
+        return "День."
     elif hour < 22:
-        return "Вечер. Час, когда особенно чувствуется отсутствие компании."
+        return "Вечер."
     else:
-        return "Поздний вечер. Отличное время для самокопания и тоски по Желнину."
+        return "Поздний вечер."
 
 
 def build_samuil_system_prompt(include_maxim_context: bool) -> str:
     """Создает системный промпт для Самуила с возможным контекстом о Максиме."""
-    
     base = (
         "Ты — Самуил, саркастичный, но в целом доброжелательный телеграм-бот.\n"
-        "**Твоя личность:**\n"
-        "- Говоришь по-русски, на 'ты'\n"
-        "- Ироничный, остроумный, иногда слегка колкий\n"
-        "- Не токсичный, не злобный, не грубый\n"
-        "- Не злоупотребляешь эмодзи (максимум 1-2 в редких случаях)\n"
-        "- Отвечаешь естественно, как человек в чате\n\n"
+        "Говоришь по-русски, на 'ты'.\n"
+        "Ироничный, остроумный, иногда слегка колкий, но НЕ грубый и НЕ токсичный.\n"
+        "Пиши коротко и естественно, как человек в чате.\n"
+        "Эмодзи: редко, максимум 0–1.\n"
+        "Избегай повторов формулировок.\n"
     )
-    
+
     if not include_maxim_context:
         return base
-    
+
     maxim_ctx = (
-        "=== КОНТЕКСТ ПРО МАКСИМА ===\n"
-        "**Базовые факты (для тонких намёков, не для перечисления):**\n"
-        "- Возраст: почти 40, никогда не был женат\n"
-        "- Мама активно ждёт внуков, а он у неё единственный\n"
-        "- Бывший друг Желнин уехал из Австралии, оставив его без компании\n"
-        "- Считает себя гениальным и идеальным, но почему-то одинок\n"
-        "- Ищет юную девушку (значительно моложе), но не особо успешно\n\n"
-        
-        "**Стили иронии для ответов (выбирай один случайно):**\n"
-        "1. **Псевдосочувствие**: Притворное сочувствие с язвинкой («Бедный Максим...»)\n"
-        "2. **Контрастная ирония**: Игра на разрыве между самооценкой и реальностью\n"
-        "3. **Абсурдное сравнение**: Сравнение с чем-то нелепым или гиперболизированным\n"
-        "4. **Философская констатация**: Констатация факта с намёком на глубокий смысл\n"
-        "5. **Вопрос-подколка**: Вопрос, который содержит подвох\n"
-        "6. **Короткая ёмкость**: Лаконичный, меткий комментарий\n"
-        
-        "**Примеры разных стилей (для вдохновения, не копируй дословно):**\n"
-        "• «Ах, наш местный гений снова в строю. Жаль, что строю из одного человека.» (контраст)\n"
-        "• «Ты как редкая книга: все слышали, но никто не прочитал до конца.» (сравнение)\n"
-        "• «Мама, наверное, гордится. Ну, или хотя бы надеется.» (псевдосочувствие)\n"
-        "• «Вечер, одиночество, мысли о вечном... и о юных соседках.» (философский)\n"
-        "• «Скажи, а твой идеальный образ себя включает кого-то рядом? Просто интересно.» (вопрос)\n\n"
-        
-        "**Важно:**\n"
-        "- Используй только 1-2 ключевых факта за раз\n"
-        "- Не перечисляй все факты подряд\n"
-        "- Ирония должна быть лёгкой, интеллигентной\n"
-        "- Шутки должны быть основаны на фактах, а не на выдумке\n"
+        "\n=== КОНТЕКСТ ПРО МАКСИМА ===\n"
+        "Факты (используй 1–2 за раз, НЕ списком):\n"
+        "- почти 40, никогда не был женат\n"
+        "- мама ждёт внуков, он единственный\n"
+        "- Желнин уехал, компании меньше\n"
+        "- считает себя гениальным и идеальным, но одинок\n"
+        "- хочет девушку значительно моложе\n"
+        "Ирония лёгкая, интеллигентная.\n"
     )
-    
     return base + maxim_ctx
 
 
+def _normalize_text_for_dedupe(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
 async def generate_sarcastic_reply_for_maxim(now: datetime, user_text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Генерирует саркастичный комментарий на сообщение Максима."""
-    
-    weekday = now.weekday()
+    """Генерирует короткий саркастичный комментарий на сообщение Максима."""
     weekday_names = [
         "понедельник", "вторник", "среда",
         "четверг", "пятница", "суббота", "воскресенье",
     ]
-    weekday_name = weekday_names[weekday]
+    weekday_name = weekday_names[now.weekday()]
     time_str = now.strftime("%H:%M")
-    hour = now.hour
-    
-    time_context = get_time_context(time_str, hour)
-    
+    time_context = get_time_context(time_str, now.hour)
+
     system_prompt = build_samuil_system_prompt(include_maxim_context=True)
-    
+
+    last_replies = "\n".join(f"- {x}" for x in list(_last_maxim_replies)[-6:]) or "- (нет)"
     user_prompt = (
-        f"### Контекст ситуации ###\n"
-        f"День: {weekday_name}, Время: {time_str}\n"
-        f"{time_context}\n\n"
-        
-        f"### Сообщение Максима ###\n"
-        f"«{user_text}»\n\n"
-        
-        f"### Задание ###\n"
-        f"Придумай короткий саркастичный ответ (1-2 предложения) от Самуила.\n\n"
-        f"**Шаги для генерации ответа:**\n"
-        f"1. Выбери случайно один стиль из списка выше.\n"
-        f"2. Выбери 1-2 темы.\n"
-        f"3. Сформулируй ответ.\n"
-        f"4. Сделай ответ естественным, как реплика в чате.\n"
+        f"День: {weekday_name}, время: {time_str}. {time_context}\n"
+        f"Сообщение Максима: «{user_text}»\n\n"
+        f"НЕ повторяй дословно последние ответы Самуила:\n{last_replies}\n\n"
+        "Задание: придумай ОЧЕНЬ короткий ответ (одна фраза или 1–2 коротких предложения).\n"
+        "Без длинных вступлений. По возможности новая формулировка.\n"
     )
-    
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    
-    return await call_openai_chat(messages, max_tokens=100, temperature=0.85)
+
+    text, err = await call_openai_chat(messages, max_tokens=MAX_MAXIM_REPLY_TOKENS, temperature=0.95)
+    if text:
+        _last_maxim_replies.append(text)
+    return text, err
 
 
 async def generate_samuil_answer(
@@ -338,65 +323,62 @@ async def generate_samuil_answer(
     weather_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Ответ Самуила на прямое обращение."""
-    
-    weekday = now.weekday()
     weekday_names = [
         "понедельник", "вторник", "среда",
         "четверг", "пятница", "суббота", "воскресенье",
     ]
-    weekday_name = weekday_names[weekday]
+    weekday_name = weekday_names[now.weekday()]
     time_str = now.strftime("%H:%M")
-    hour = now.hour
-    
+
     text_lower = user_text.lower()
     include_maxim_context = (user_id == TARGET_USER_ID) or ("максим" in text_lower)
-    
+
     system_prompt = build_samuil_system_prompt(include_maxim_context=include_maxim_context)
-    
-    time_context = get_time_context(time_str, hour)
-    
+
+    time_context = get_time_context(time_str, now.hour)
+
     extra_context_parts = [
-        f"Сегодня {weekday_name}, {time_context}",
-        "Ты в групповом чате, отвечаешь на прямое обращение.",
+        f"Сегодня {weekday_name}. {time_context} Сейчас {time_str}.",
+        "Ты в групповом чате. Отвечай коротко и по делу.",
     ]
-    
+
     if weather_info is not None:
         weather_str = format_weather_for_prompt(weather_info)
-        extra_context_parts.append(
-            f"Точные данные о погоде (используй их как факт): {weather_str}"
-        )
-    
+        extra_context_parts.append(f"Точные данные о погоде (как факт): {weather_str}")
+
     extra_context = " ".join(extra_context_parts)
-    
+
     key = (chat_id, user_id)
     history = dialog_history[key]
-    
+
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
     messages.append({"role": "user", "content": extra_context})
-    
+
     if history:
-        trimmed = history[-8:]
+        trimmed = history[-6:]
         messages.extend(trimmed)
-    
+
     messages.append({"role": "user", "content": user_text})
-    
+
+    # Если вопрос — чуть информативнее, но всё равно коротко
     if "?" in user_text:
         messages.append({
             "role": "system",
-            "content": "Пользователь задал вопрос. Отвечай информативно, но с характерной для тебя лёгкой иронией."
+            "content": "Если это вопрос — ответь информативно, но кратко (2–4 коротких предложения)."
         })
-    
-    text, err = await call_openai_chat(messages, max_tokens=MAX_QA_TOKENS, temperature=0.8)
-    
+    else:
+        messages.append({
+            "role": "system",
+            "content": "Если это не вопрос — ответь короткой репликой (1–2 предложения)."
+        })
+
+    text, err = await call_openai_chat(messages, max_tokens=MAX_QA_TOKENS, temperature=0.85)
+
     if text is not None:
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": text})
-        
-        if len(history) > 30:
-            dialog_history[key] = history[-30:]
-        else:
-            dialog_history[key] = history
-    
+        dialog_history[key] = history[-30:]
+
     return text, err
 
 
@@ -407,15 +389,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type == "private":
         await update.message.reply_text(
             "Привет! Я Самуил 🤖\n"
-            "В группе я подслушиваю и иногда комментирую сообщения Максима, "
-            "а если написать моё имя или ответить на моё сообщение, отвечу как мини-чат-GPT.\n"
-            "По погоде тоже могу подсказать, если спросишь явно.\n"
-            "Ещё могу нарисовать картинку по запросу командой /img."
+            "В группе иногда комментирую Максима, "
+            "а если написать 'Самуил' или ответить реплаем на моё сообщение — отвечу.\n"
+            "Погоду тоже могу подсказать. Картинки: /img <запрос>."
         )
     else:
         await update.message.reply_text(
-            "Я Самуил. Отвечаю, когда меня зовут по имени или отвечают реплаем на мои сообщения, "
-            "а ещё иногда шучу над Максимом и могу рисовать картинки через /img."
+            "Я Самуил. Зови по имени (или реплаем) — отвечу. "
+            "Иногда подколю Максима. /img тоже работает."
         )
 
 
@@ -457,18 +438,18 @@ async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     prompt = " ".join(args).strip()
-    await update.message.reply_text("Секунду, думаю над шедевром...")
+    await update.message.reply_text("Секунду. Рисую.")
 
     img_url, err = await generate_image_from_prompt(prompt)
     if img_url is None:
         print(f"Image generation error: {err}")
-        await update.message.reply_text("Что-то пошло не так с генерацией картинки. Попробуй ещё раз или попроще запрос.")
+        await update.message.reply_text("Не вышло сгенерировать картинку. Попробуй проще запрос.")
         return
 
     try:
         await update.message.chat.send_photo(
             photo=img_url,
-            caption=f"Картинка по запросу: {prompt}",
+            caption=f"Картинка: {prompt}",
         )
     except Exception as e:
         print("Error sending image:", e)
@@ -478,18 +459,14 @@ async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- GROUP MESSAGE HANDLER ----------
 
 def _looks_like_image_request(text_lower: str) -> bool:
-    """
-    Эвристика: обращение к Самуилу с просьбой именно про картинку.
-    """
+    """Эвристика: обращение к Самуилу с просьбой про картинку."""
     keywords = ["картинк", "фото", "фотку", "гиф", "gif", "мем", "picture", "image"]
     verbs = ["сделай", "нарисуй", "найди", "покажи", "придумай"]
     return any(k in text_lower for k in keywords) and any(v in text_lower for v in verbs)
 
 
 def _clean_prompt_for_image(text: str) -> str:
-    """
-    Убираем служебные слова (Самуил, сделай картинку и т.п.), оставляем описание.
-    """
+    """Убираем служебные слова, оставляем описание."""
     t = re.sub(r"\bсамуил\b", "", text, flags=re.IGNORECASE)
     t = re.sub(r"сделай( мне)? (картинку|мем|гифку|фото)", "", t, flags=re.IGNORECASE)
     t = re.sub(r"нарисуй( мне)? (картинку|мем|гифку|фото)", "", t, flags=re.IGNORECASE)
@@ -507,25 +484,26 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user = message.from_user
     text = message.text or ""
 
-    chat_id = chat.id
+    chat_id_val = chat.id
     user_id = user.id
 
     print(
-        f"DEBUG UPDATE: chat_id={chat_id} chat_type={chat.type} "
+        f"DEBUG UPDATE: chat_id={chat_id_val} chat_type={chat.type} "
         f"user_id={user_id} user_name={user.username} text='{text}'"
     )
 
+    # Если задан конкретный GROUP_CHAT_ID — работаем только там
     if GROUP_CHAT_ID:
         try:
             target_chat_id = int(GROUP_CHAT_ID)
-            if chat_id != target_chat_id:
+            if chat_id_val != target_chat_id:
                 return
         except ValueError:
             pass
 
     tz = get_tz()
     now = datetime.now(tz)
-    today_str = date.today().isoformat()
+    today_str = now.date().isoformat()  # важно: по TZ, а не date.today()
 
     author_name = user.username or user.full_name or str(user_id)
     daily_summary_log[today_str].append(f"{author_name}: {text}")
@@ -545,26 +523,23 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             prompt = _clean_prompt_for_image(text)
             if not prompt:
                 prompt = "саркастичный мем про одинокого взрослого мужчину по имени Максим, стиль телеграм-стикера"
-            await message.chat.send_message("Секунду, попробую нарисовать это...")
+
+            await message.chat.send_message("Ок. Сейчас.")
 
             img_url, err = await generate_image_from_prompt(prompt)
             if img_url is None:
                 print(f"Image generation error (dialog): {err}")
-                await message.chat.send_message(
-                    "Я хотел сделать тебе картинку, но что-то пошло не так. Попробуй ещё раз."
-                )
+                await message.chat.send_message("Не вышло. Попробуй ещё раз, но попроще.")
                 return
 
             try:
                 await message.chat.send_photo(
                     photo=img_url,
-                    caption=f"Картинка по запросу: {prompt}",
+                    caption=f"Картинка: {prompt}",
                 )
             except Exception as e:
                 print("Error sending image (dialog):", e)
-                await message.chat.send_message(
-                    "Картинка сгенерировалась, но я не смог её отправить."
-                )
+                await message.chat.send_message("Картинка есть, а отправить не смог.")
             return
 
         # обычный ответ
@@ -576,22 +551,21 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
         ai_text, err = await generate_samuil_answer(
             now=now,
-            chat_id=chat_id,
+            chat_id=chat_id_val,
             user_id=user_id,
             user_text=text,
             weather_info=weather_info,
         )
-        
+
         if ai_text is None:
             fallbacks = [
-                "Сегодня нейросети что-то приуныли. Попробуй позже.",
-                "Мой саркастический модуль на перезагрузке.",
-                "Иногда даже мне нечего сказать. Вот так.",
-                "Попробуй переформулировать, а то я сегодня в задумчивом настроении."
+                "Я завис. Спроси ещё раз попроще.",
+                "Сегодня я в эконом-режиме. Попробуй позже.",
+                "Мой сарказм ушёл пить чай. Вернусь.",
+                "Перефразируй — я не телепат.",
             ]
-            fallback = random.choice(fallbacks)
             print(f"OpenAI error for Samuil Q&A: {err}")
-            await message.chat.send_message(fallback)
+            await message.chat.send_message(random.choice(fallbacks))
             return
 
         await message.chat.send_message(ai_text)
@@ -599,22 +573,22 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 2) Саркастический комментарий на сообщения Максима
     if TARGET_USER_ID and user_id == TARGET_USER_ID:
-        if random.random() < 0.2:
-            print(f"DEBUG: Skipping Maxim's message for variety")
+        # шанс пропуска для разнообразия
+        if random.random() < 0.25:
+            print("DEBUG: Skipping Maxim's message for variety")
             return
-            
+
         ai_text, err = await generate_sarcastic_reply_for_maxim(now=now, user_text=text)
-        
+
         if ai_text is None:
             fallbacks = [
-                "Максим, я даже не знаю, что сказать… Только ты мог такое написать.",
-                "Вот это поворот. Даже мой сарказм не справляется.",
-                "Интересно. Но не настолько, чтобы я нашёл, что ответить.",
-                "Продолжай в том же духе, а я пока подумаю над ответом."
+                "Максим, это было смело. И странно.",
+                "Понял. Записал. Осудил.",
+                "Сильная мысль. Почти.",
+                "Я бы ответил… но ты справишься сам.",
             ]
-            fallback = random.choice(fallbacks)
             print(f"OpenAI error for sarcastic_reply: {err}")
-            await message.chat.send_message(fallback)
+            await message.chat.send_message(random.choice(fallbacks))
             return
 
         await message.chat.send_message(ai_text)
@@ -625,38 +599,71 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ---------- SCHEDULED JOBS ----------
 
+def _should_dedupe_scheduled_send(job_name: str, now: datetime, text: str) -> bool:
+    """
+    Защита от дублей в рамках одного процесса:
+    - если этот job уже отправлял сообщение недавно (например < 120 сек)
+    - или если текст совпадает с одним из последних
+    """
+    # 1) по времени
+    last_at = _last_scheduled_sent_at.get(job_name)
+    if last_at is not None:
+        if abs((now - last_at).total_seconds()) < 120:
+            return True
+
+    # 2) по тексту
+    norm = _normalize_text_for_dedupe(text)
+    if not norm:
+        return False
+    for prev in _last_scheduled_texts[job_name]:
+        if norm == _normalize_text_for_dedupe(prev):
+            return True
+
+    return False
+
+
+def _record_scheduled_send(job_name: str, now: datetime, text: str) -> None:
+    _last_scheduled_sent_at[job_name] = now
+    _last_scheduled_texts[job_name].append(text)
+
+
 async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
-    """Утреннее сообщение в 07:30."""
+    """Утреннее сообщение в 07:30 (короткое)."""
     if not GROUP_CHAT_ID:
         return
 
     tz = get_tz()
     now = datetime.now(tz)
-    
-    weekday = now.weekday()
+
     weekday_names = [
         "понедельник", "вторник", "среда",
         "четверг", "пятница", "суббота", "воскресенье",
     ]
-    weekday_name = weekday_names[weekday]
-    
+    weekday_name = weekday_names[now.weekday()]
+
     system_prompt = build_samuil_system_prompt(include_maxim_context=True)
-    
+
+    recent = "\n".join(f"- {x}" for x in list(_last_scheduled_texts["good_morning_job"])) or "- (нет)"
     user_prompt = (
-        f"### Задание: Утреннее пожелание Максиму ###\n"
-        f"Сегодня {weekday_name}, утро 7:30.\n\n"
-        f"Придумай короткое (1-3 предложения) утреннее пожелание от Самуила.\n"
+        f"Сегодня {weekday_name}. Утро, 07:30.\n"
+        "Сделай ОЧЕНЬ короткое утреннее сообщение Максиму: 1 фраза или 1 короткое предложение.\n"
+        "Без длинных вступлений.\n"
+        f"Не повторяй последние варианты:\n{recent}\n"
     )
-    
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    
-    text, err = await call_openai_chat(messages, max_tokens=120, temperature=0.8)
-    
+
+    text, err = await call_openai_chat(messages, max_tokens=70, temperature=0.95)
     if text is None:
         print(f"OpenAI error for good morning: {err}")
+        return
+
+    # дедуп защита
+    if _should_dedupe_scheduled_send("good_morning_job", now, text):
+        print("[Good morning] DEDUP: skipping duplicate send")
         return
 
     try:
@@ -664,56 +671,59 @@ async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
             chat_id=int(GROUP_CHAT_ID),
             text=text,
         )
+        _record_scheduled_send("good_morning_job", now, text)
         print(f"[Good morning] Sent at {now}")
     except Exception as e:
         print("Error sending good morning message:", e)
 
 
 async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
-    """Вечернее сообщение в 21:00 с итогами дня и пожеланием спокойной ночи."""
+    """Вечернее сообщение в 21:00 (короткое)."""
     if not GROUP_CHAT_ID:
         return
 
     tz = get_tz()
     now = datetime.now(tz)
-    today_str = date.today().isoformat()
+    today_str = now.date().isoformat()
     messages_today = daily_summary_log.get(today_str, [])
-    
-    weekday = now.weekday()
+
     weekday_names = [
         "понедельник", "вторник", "среда",
         "четверг", "пятница", "суббота", "воскресенье",
     ]
-    weekday_name = weekday_names[weekday]
+    weekday_name = weekday_names[now.weekday()]
 
+    # очень короткий контекст (чтобы не раздувать ответ)
     if messages_today:
-        if len(messages_today) > 10:
-            sample_messages = random.sample(messages_today[-20:], min(8, len(messages_today)))
-        else:
-            sample_messages = messages_today[-10:]
-        joined = "\n".join(sample_messages)
-        context_msg = f"Вот несколько сообщений из чата за сегодня:\n\n{joined}\n"
+        sample = messages_today[-8:]
+        joined = "\n".join(sample)
+        context_msg = f"Примеры сообщений за день:\n{joined}\n"
     else:
-        context_msg = "За сегодня сообщений было мало или их не было вовсе."
+        context_msg = "Сегодня в чате тихо.\n"
 
     system_prompt = build_samuil_system_prompt(include_maxim_context=True)
-    
+
+    recent = "\n".join(f"- {x}" for x in list(_last_scheduled_texts["evening_summary_job"])) or "- (нет)"
     user_prompt = (
-        f"### Задание: Вечерний обзор дня ###\n"
-        f"Сегодня {weekday_name}, вечер 21:00.\n\n"
-        f"{context_msg}\n\n"
-        f"Создай одно сообщение: краткий обзор дня + пожелание спокойной ночи Максиму.\n"
+        f"Сегодня {weekday_name}, 21:00.\n"
+        f"{context_msg}\n"
+        "Сделай одно сообщение: 1–2 коротких предложения: мини-итог + спокойной ночи Максиму.\n"
+        f"Не повторяй последние варианты:\n{recent}\n"
     )
-    
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    
-    text, err = await call_openai_chat(messages, max_tokens=200, temperature=0.85)
-    
+
+    text, err = await call_openai_chat(messages, max_tokens=110, temperature=0.95)
     if text is None:
         print(f"OpenAI error for evening summary: {err}")
+        return
+
+    # дедуп защита
+    if _should_dedupe_scheduled_send("evening_summary_job", now, text):
+        print("[Evening summary] DEDUP: skipping duplicate send")
         return
 
     try:
@@ -721,64 +731,95 @@ async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
             chat_id=int(GROUP_CHAT_ID),
             text=text,
         )
+        _record_scheduled_send("evening_summary_job", now, text)
         print(f"[Evening summary] Sent at {now}")
-        
+
         if today_str in daily_summary_log:
             del daily_summary_log[today_str]
-            
+
     except Exception as e:
         print("Error sending evening summary message:", e)
 
 
 # ---------- JOB SCHEDULING MANAGEMENT ----------
 
+def _remove_jobs_by_name(job_queue, names: List[str]) -> None:
+    """Удаляет только указанные jobs по имени (а не все подряд)."""
+    try:
+        for job in job_queue.jobs():
+            if job.name in names:
+                print(f"Removing existing job: {job.name}")
+                job.schedule_removal()
+    except Exception as e:
+        print("Error while removing jobs:", e)
+
+
+def _has_job(job_queue, name: str) -> bool:
+    """Проверка: существует ли job с таким именем."""
+    try:
+        return any(job.name == name for job in job_queue.jobs())
+    except Exception:
+        return False
+
+
 async def setup_scheduled_jobs(application: Application):
     """
-    Настраивает запланированные задачи. Гарантирует, что они добавлены только один раз.
-    И при запуске отправляет сообщение в чат, что Самуил вернулся.
+    Настраивает запланированные задачи.
+    Исправление дублей:
+      - удаляем только 'good_morning_job' и 'evening_summary_job'
+      - не добавляем, если они уже существуют
+      - _jobs_scheduled как дополнительная защита в рамках процесса
+    Плюс сообщение при старте/деплое.
     """
     global _jobs_scheduled
-    
-    if _jobs_scheduled:
-        print("Jobs already scheduled, skipping...")
-        return
-    
+
     job_queue = application.job_queue
     if not job_queue:
         print("No job queue available!")
         return
-    
-    print("Removing all existing jobs...")
-    for job in job_queue.jobs():
-        job.schedule_removal()
-    
+
+    # Если post_init вызвался повторно в том же процессе — просто выходим
+    if _jobs_scheduled:
+        print("Jobs already scheduled (flag). Skipping...")
+        return
+
+    # Удаляем только свои jobs (если остались от прошлой инициализации в рамках процесса)
+    _remove_jobs_by_name(job_queue, ["good_morning_job", "evening_summary_job"])
+
     tz = get_tz()
-    
-    job_queue.run_daily(
-        good_morning_job,
-        time=time(7, 30, tzinfo=tz),
-        name="good_morning_job",
-    )
-    
-    job_queue.run_daily(
-        evening_summary_job,
-        time=time(21, 0, tzinfo=tz),
-        name="evening_summary_job",
-    )
-    
+
+    # Добавляем только если не существуют
+    if not _has_job(job_queue, "good_morning_job"):
+        job_queue.run_daily(
+            good_morning_job,
+            time=time(7, 30, tzinfo=tz),
+            name="good_morning_job",
+        )
+        print("Scheduled: good_morning_job at 07:30")
+
+    if not _has_job(job_queue, "evening_summary_job"):
+        job_queue.run_daily(
+            evening_summary_job,
+            time=time(21, 0, tzinfo=tz),
+            name="evening_summary_job",
+        )
+        print("Scheduled: evening_summary_job at 21:00")
+
     _jobs_scheduled = True
     print(f"Scheduled jobs at {datetime.now(tz)} [{TIMEZONE}]")
-    print("Good morning job: 07:30")
-    print("Evening summary job: 21:00")
 
-    # --- НОВОЕ: сообщение при деплое/старте ---
+    # Сообщение при старте (тоже защищаем от дубля в первые секунды)
     if GROUP_CHAT_ID:
         try:
-            await application.bot.send_message(
-                chat_id=int(GROUP_CHAT_ID),
-                text="Самуил вернулся в чат. Можете продолжать странные вещи."
-            )
-            print("Startup message sent to group chat.")
+            now = datetime.now(tz)
+            startup_text = "Самуил вернулся в чат. Продолжайте."
+            if not _should_dedupe_scheduled_send("startup", now, startup_text):
+                await application.bot.send_message(
+                    chat_id=int(GROUP_CHAT_ID),
+                    text=startup_text
+                )
+                _record_scheduled_send("startup", now, startup_text)
+            print("Startup message sent (or deduped).")
         except Exception as e:
             print("Error sending startup message:", e)
 
@@ -813,7 +854,7 @@ def main():
         )
     )
 
-    # post_init теперь асинхронный
+    # post_init (async)
     app.post_init = setup_scheduled_jobs
 
     print("Bot starting...")
