@@ -358,6 +358,52 @@ def _normalize_text_for_dedupe(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
+def _should_dedupe_scheduled_send(job_name: str, now: datetime, text: str) -> bool:
+    """
+    Защита от дублей в рамках одного процесса.
+    """
+    # Нормализуем текст для сравнения
+    norm = _normalize_text_for_dedupe(text)
+    if not norm:
+        return False
+    
+    # 1) Проверка по времени (не чаще чем раз в 10 минут для scheduled jobs)
+    last_at = _last_scheduled_sent_at.get(job_name)
+    if last_at is not None:
+        time_diff = abs((now - last_at).total_seconds())
+        if time_diff < 600:  # 10 минут вместо 5
+            logger.info(f"Dedupe: too soon since last send ({time_diff:.0f}s)")
+            return True
+
+    # 2) Проверка по тексту (строгая)
+    for prev in _last_scheduled_texts[job_name]:
+        prev_norm = _normalize_text_for_dedupe(prev)
+        if norm == prev_norm:
+            logger.info(f"Dedupe: duplicate text detected for {job_name}")
+            return True
+        
+        # Проверка на очень похожие тексты (80% совпадение)
+        if len(norm) > 20 and len(prev_norm) > 20:
+            # Простая проверка на схожесть
+            words_current = set(norm.split())
+            words_prev = set(prev_norm.split())
+            common_words = words_current.intersection(words_prev)
+            similarity = len(common_words) / max(len(words_current), len(words_prev))
+            
+            if similarity > 0.8:  # 80% совпадение слов
+                logger.info(f"Dedupe: high similarity ({similarity:.0%}) for {job_name}")
+                return True
+
+    return False
+
+
+def _record_scheduled_send(job_name: str, now: datetime, text: str) -> None:
+    """Запись факта отправки запланированного сообщения."""
+    _last_scheduled_sent_at[job_name] = now
+    _last_scheduled_texts[job_name].append(text)
+    logger.info(f"Recorded send for {job_name} at {now}")
+
+
 async def generate_sarcastic_reply_for_maxim(now: datetime, user_text: str) -> Tuple[Optional[str], Optional[str]]:
     """Генерация короткого саркастичного комментария на сообщение Максима."""
     weekday_names = [
@@ -736,35 +782,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ---------- SCHEDULED JOBS ----------
 
-def _should_dedupe_scheduled_send(job_name: str, now: datetime, text: str) -> bool:
-    """
-    Защита от дублей в рамках одного процесса.
-    """
-    # 1) Проверка по времени (не чаще чем раз в 5 минут для scheduled jobs)
-    last_at = _last_scheduled_sent_at.get(job_name)
-    if last_at is not None:
-        time_diff = abs((now - last_at).total_seconds())
-        if time_diff < 300:  # 5 минут
-            return True
-
-    # 2) Проверка по тексту
-    norm = _normalize_text_for_dedupe(text)
-    if not norm:
-        return False
-        
-    for prev in _last_scheduled_texts[job_name]:
-        if norm == _normalize_text_for_dedupe(prev):
-            return True
-
-    return False
-
-
-def _record_scheduled_send(job_name: str, now: datetime, text: str) -> None:
-    """Запись факта отправки запланированного сообщения."""
-    _last_scheduled_sent_at[job_name] = now
-    _last_scheduled_texts[job_name].append(text)
-
-
 async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
     """Утреннее сообщение в 07:30."""
     if not GROUP_CHAT_ID:
@@ -772,6 +789,17 @@ async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
 
     tz = get_tz()
     now = datetime.now(tz)
+    
+    # Дополнительная проверка - логгируем вызов
+    logger.info(f"[Good morning job] Called at {now}")
+    
+    # Проверяем, не был ли уже выполнен сегодня
+    today_str = now.date().isoformat()
+    last_send_key = f"good_morning_sent_{today_str}"
+    
+    if last_send_key in _last_scheduled_sent_at:
+        logger.info(f"[Good morning] Already sent today ({today_str}), skipping")
+        return
 
     weekday_names = [
         "понедельник", "вторник", "среда",
@@ -816,6 +844,8 @@ async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
             text=text,
         )
         _record_scheduled_send("good_morning_job", now, text)
+        # Запоминаем, что отправили сегодня
+        _last_scheduled_sent_at[last_send_key] = now
         logger.info(f"[Good morning] Sent at {now}")
     except Exception as e:
         logger.error(f"Error sending good morning message: {e}")
@@ -828,7 +858,18 @@ async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
 
     tz = get_tz()
     now = datetime.now(tz)
+    
+    # Дополнительная проверка - логгируем вызов
+    logger.info(f"[Evening summary job] Called at {now}")
+    
+    # Проверяем, не был ли уже выполнен сегодня
     today_str = now.date().isoformat()
+    last_send_key = f"evening_summary_sent_{today_str}"
+    
+    if last_send_key in _last_scheduled_sent_at:
+        logger.info(f"[Evening summary] Already sent today ({today_str}), skipping")
+        return
+    
     messages_today = daily_summary_log.get(today_str, [])
 
     weekday_names = [
@@ -889,6 +930,8 @@ async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
             text=text,
         )
         _record_scheduled_send("evening_summary_job", now, text)
+        # Запоминаем, что отправили сегодня
+        _last_scheduled_sent_at[last_send_key] = now
         logger.info(f"[Evening summary] Sent at {now}")
 
         # Очищаем логи за сегодня
@@ -907,6 +950,7 @@ class JobManager:
     def __init__(self):
         self.jobs_setup = False
         self.setup_time = None
+        self.job_names = set()  # Храним имена созданных задач
         
     async def setup_jobs(self, application: Application):
         """Настройка запланированных задач с защитой от дублей."""
@@ -922,31 +966,43 @@ class JobManager:
         tz = get_tz()
         now = datetime.now(tz)
         
-        # Удаляем старые задачи с такими же функциями
+        # ОЧЕНЬ ВАЖНО: очищаем ВСЕ старые задачи Самуила
         existing_jobs = list(job_queue.jobs())
         jobs_to_remove = []
         
         for job in existing_jobs:
+            # Удаляем все задачи с нашими функциями
             if hasattr(job.callback, '__name__'):
                 if job.callback.__name__ in ['good_morning_job', 'evening_summary_job']:
                     jobs_to_remove.append(job)
                     
         for job in jobs_to_remove:
-            job.schedule_removal()
-            logger.info(f"Removed old job: {job.name}")
+            try:
+                job.schedule_removal()
+                logger.info(f"Removed old job: {job.name}")
+            except Exception as e:
+                logger.error(f"Error removing job {job.name}: {e}")
+        
+        # Даем время на удаление
+        await asyncio.sleep(1)
         
         # Добавляем новые задачи
         morning_job = job_queue.run_daily(
             good_morning_job,
             time=time(7, 30, tzinfo=tz),
-            name=f"good_morning_job_{int(now.timestamp())}",
+            name=f"samuil_good_morning_{int(now.timestamp())}",
         )
         
         evening_job = job_queue.run_daily(
             evening_summary_job,
             time=time(21, 0, tzinfo=tz),
-            name=f"evening_summary_job_{int(now.timestamp())}",
+            name=f"samuil_evening_summary_{int(now.timestamp())}",
         )
+        
+        if morning_job:
+            self.job_names.add(morning_job.name)
+        if evening_job:
+            self.job_names.add(evening_job.name)
         
         self.jobs_setup = True
         self.setup_time = now
@@ -955,26 +1011,32 @@ class JobManager:
         logger.info(f"Morning job: {morning_job.name if morning_job else 'failed'}")
         logger.info(f"Evening job: {evening_job.name if evening_job else 'failed'}")
         
+        # Сбрадываем историю дедупликации при старте
+        global _last_scheduled_sent_at, _last_scheduled_texts
+        _last_scheduled_sent_at.clear()
+        _last_scheduled_texts.clear()
+        
         # Отправляем сообщение о старте (с задержкой)
         if GROUP_CHAT_ID:
             try:
-                # Ждем 3 секунды, чтобы бот точно был готов
-                await asyncio.sleep(3)
+                # Ждем 5 секунд, чтобы бот точно был готов
+                await asyncio.sleep(5)
                 
-                startup_texts = [
-                    "Самуил в сети. Режим наблюдения.",
-                    "Система активна. Все датчики в норме.",
-                    "Бот запущен. Приступаю к мониторингу.",
-                ]
-                
-                await context.bot.send_message(
-                    chat_id=int(GROUP_CHAT_ID),
-                    text=random.choice(startup_texts)
-                )
-                logger.info("Startup message sent.")
+                # Отправляем только если бот недавно запустился
+                if datetime.now(tz).timestamp() - now.timestamp() < 30:
+                    startup_texts = [
+                        "Самуил в сети. Режим наблюдения.",
+                        "Система активна. Все датчики в норме.",
+                        "Бот запущен. Приступаю к мониторингу.",
+                    ]
+                    
+                    await application.bot.send_message(
+                        chat_id=int(GROUP_CHAT_ID),
+                        text=random.choice(startup_texts)
+                    )
+                    logger.info("Startup message sent.")
             except Exception as e:
                 logger.error(f"Error sending startup message: {e}")
-
 
 # Создаем глобальный менеджер задач
 job_manager = JobManager()
@@ -1005,6 +1067,11 @@ def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in environment variables!")
 
+    # Очищаем глобальное состояние при старте
+    global _last_scheduled_sent_at, _last_scheduled_texts
+    _last_scheduled_sent_at.clear()
+    _last_scheduled_texts.clear()
+    
     # Создаем приложение с настройками
     app = Application.builder().token(TOKEN).build()
     
