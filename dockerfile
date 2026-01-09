@@ -1,18 +1,15 @@
-app = "telegram-bot-mfitfq"
-primary_region = "syd"
+FROM python:3.11-slim
 
-[build]
-  # Dockerfile
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-[env]
+WORKDIR /app
 
-[processes]
-  app = "python bot.py"
+# Dependencies first (better caching)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-[vm]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+# App code
+COPY . /app
 
-[scale]
-  min = 1
-  max = 1
+CMD ["python", "bot.py"]
