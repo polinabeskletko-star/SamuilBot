@@ -4,13 +4,14 @@ import json
 import random
 import asyncio
 import logging
-from datetime import datetime, time, date, timedelta
+from datetime import datetime, time, date
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional, Any
+import uuid
 
 import pytz
 import httpx
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -18,7 +19,6 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-    JobQueue,
 )
 
 # ==== SETTINGS & ENV ====
@@ -36,9 +36,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 # OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-4o-mini")  # Исправлено
 
-# Используем асинхронного клиента OpenAI
 client: Optional[AsyncOpenAI] = None
 if OPENAI_API_KEY:
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -55,32 +53,30 @@ logger = logging.getLogger(__name__)
 
 # ---------- GLOBAL STATE ----------
 
-# История диалогов с Самуилом: (chat_id, user_id) -> list[{"role": "...", "content": "..."}]
-dialog_history: Dict[Tuple[int, int], List[Dict[str, str]]] = defaultdict(list)
+# Помогает мгновенно понять, один ли процесс работает
+INSTANCE_TAG = os.environ.get("INSTANCE_TAG") or str(uuid.uuid4())[:8]
 
-# Логи сообщений для вечернего анализа: date_str -> list[str]
+dialog_history: Dict[Tuple[int, int], List[Dict[str, str]]] = defaultdict(list)
 daily_summary_log: Dict[str, List[str]] = defaultdict(list)
 
-# Дедуп отправки плановых сообщений
 # job_name -> datetime last_sent_at (tz-aware)
 _last_scheduled_sent_at: Dict[str, datetime] = {}
 # job_name -> deque последних текстов
 _last_scheduled_texts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
-# Для разнообразия ответов Максиму: хранить последние ответы
 _last_maxim_replies: deque = deque(maxlen=8)
 
-# Кэш для погоды: city -> (data, timestamp)
 _weather_cache: Dict[str, Tuple[Dict[str, Any], datetime]] = {}
 WEATHER_CACHE_TTL = 300  # 5 минут
 
-# Кэш для OpenAI ответов: hash -> (response, timestamp)
 _openai_cache: Dict[str, Tuple[str, datetime]] = {}
 OPENAI_CACHE_TTL = 600  # 10 минут
 
-# Кэш для "события дня": date_key -> (text, timestamp)
 _onthisday_cache: Dict[str, Tuple[str, datetime]] = {}
 ONTHISDAY_CACHE_TTL = 6 * 3600  # 6 часов
+
+# флаги "отправлено сегодня" для scheduled (в рамках процесса)
+_sent_day_flags: Dict[str, datetime] = {}
 
 # ---------- HELPERS ----------
 
@@ -88,14 +84,7 @@ def get_tz() -> pytz.BaseTzInfo:
     return pytz.timezone(TIMEZONE)
 
 
-def is_night_time(dt: datetime) -> bool:
-    """Ночь: с 22:00 включительно до 07:00 (07:00 уже не ночь)."""
-    hour = dt.hour
-    return hour >= 22 or hour < 7
-
-
 async def log_to_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
-    """Логирование в админский чат."""
     if ADMIN_CHAT_ID:
         try:
             await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=message)
@@ -104,7 +93,6 @@ async def log_to_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
 
 
 def generate_cache_key(messages: List[Dict[str, str]], max_tokens: int, temperature: float) -> str:
-    """Генерация ключа для кэша OpenAI запросов."""
     import hashlib
     key_str = f"{json.dumps(messages, sort_keys=True)}:{max_tokens}:{temperature}"
     return hashlib.md5(key_str.encode()).hexdigest()
@@ -116,21 +104,15 @@ async def call_openai_chat(
     temperature: float = 0.7,
     use_cache: bool = True,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Универсальная обёртка над OpenAI chat.completions.
-    Использует кэширование для одинаковых запросов.
-    """
     if client is None:
         return None, "OpenAI client is not configured (no API key)."
 
-    # Проверяем кэш
     if use_cache:
         cache_key = generate_cache_key(messages, max_tokens, temperature)
         cached_data = _openai_cache.get(cache_key)
         if cached_data:
             response, timestamp = cached_data
             if (datetime.now() - timestamp).total_seconds() < OPENAI_CACHE_TTL:
-                logger.debug(f"Using cached OpenAI response for key: {cache_key[:8]}")
                 return response, None
 
     try:
@@ -156,10 +138,6 @@ async def call_openai_chat(
 
 
 async def generate_image_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Генерация картинки через OpenAI Images по текстовому запросу.
-    Возвращает (image_url, error_message).
-    """
     if client is None:
         return None, "OpenAI client is not configured (no API key)."
 
@@ -182,12 +160,7 @@ async def generate_image_from_prompt(prompt: str) -> Tuple[Optional[str], Option
 # ---------- WEATHER HELPERS ----------
 
 async def fetch_weather_for_city(city_query: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
-    """
-    Получить погоду из OpenWeather по названию города.
-    Использует кэширование.
-    """
     if not OPENWEATHER_API_KEY:
-        logger.warning("No OPENWEATHER_API_KEY configured")
         return None
 
     if use_cache:
@@ -195,7 +168,6 @@ async def fetch_weather_for_city(city_query: str, use_cache: bool = True) -> Opt
         if cached_data:
             data, timestamp = cached_data
             if (datetime.now() - timestamp).total_seconds() < WEATHER_CACHE_TTL:
-                logger.debug(f"Using cached weather for: {city_query}")
                 return data
 
     url = "https://api.openweathermap.org/data/2.5/weather"
@@ -238,11 +210,7 @@ async def fetch_weather_for_city(city_query: str, use_cache: bool = True) -> Opt
 
 
 def detect_weather_city_from_text(text: str) -> Optional[str]:
-    """
-    Пытаемся понять, для какого города просят погоду.
-    """
     t = text.lower()
-
     city_mapping = {
         "калуге": "Kaluga,ru",
         "калуга": "Kaluga,ru",
@@ -264,22 +232,13 @@ def detect_weather_city_from_text(text: str) -> Optional[str]:
 
     m = re.search(r"\b(?:в|в городе)\s+([А-Яа-яA-Za-z\-]+)", t)
     if m:
-        city_raw = m.group(1)
-        if any(cyr_char in city_raw for cyr_char in "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"):
-            city_lower = city_raw.lower()
-            for russian, english in city_mapping.items():
-                if city_lower in russian:
-                    return english
-        return city_raw
-
+        return m.group(1)
     return None
 
 
 def format_weather_for_prompt(info: Dict[str, Any]) -> str:
-    """Форматирование данных о погоде для промпта."""
     if not info:
         return ""
-
     parts = []
     city = info.get("city")
     country = info.get("country")
@@ -303,12 +262,40 @@ def format_weather_for_prompt(info: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-# ---------- TODAY: HOLIDAYS & EVENTS (Wikipedia On This Day) ----------
+# ---------- TODAY: HOLIDAYS & EVENTS (Wikimedia On This Day) ----------
 
-async def fetch_onthisday_ru(d: date, use_cache: bool = True) -> Optional[str]:
+def _smart_truncate(text: str, max_len: int = 3900) -> str:
+    """
+    Умная обрезка под лимит Telegram (4096).
+    Стараемся резать по границе пункта/строки/слова, а не посреди.
+    """
+    if not text or len(text) <= max_len:
+        return text
+
+    cut = text[:max_len]
+
+    # 1) По началу следующего буллета
+    idx = cut.rfind("\n• ")
+    if idx > 0 and idx > max_len * 0.6:
+        cut = cut[:idx]
+    else:
+        # 2) По строке
+        idx = cut.rfind("\n")
+        if idx > 0 and idx > max_len * 0.6:
+            cut = cut[:idx]
+        else:
+            # 3) По слову
+            idx = cut.rfind(" ")
+            if idx > 0 and idx > max_len * 0.6:
+                cut = cut[:idx]
+
+    return cut.rstrip() + "\n…"
+
+
+async def fetch_onthisday_ru(d: date, use_cache: bool = True, max_len: int = 3900) -> Optional[str]:
     """
     Берём праздники/события "в этот день" из Wikimedia API (ru).
-    Возвращаем уже готовый короткий текст для Telegram.
+    Возвращаем готовый текст для Telegram, с безопасной длиной и аккуратной обрезкой.
     """
     key = d.isoformat()
     now = datetime.now()
@@ -323,11 +310,7 @@ async def fetch_onthisday_ru(d: date, use_cache: bool = True) -> Optional[str]:
     mm = f"{d.month:02d}"
     dd = f"{d.day:02d}"
     url = f"https://api.wikimedia.org/feed/v1/wikipedia/ru/onthisday/all/{mm}/{dd}"
-
-    headers = {
-        # Вежливо: некоторые CDN/endpoint любят User-Agent
-        "User-Agent": "SamuilBot/1.0 (telegram-bot; onthisday feature)"
-    }
+    headers = {"User-Agent": f"SamuilBot/1.0 (telegram-bot; onthisday; {INSTANCE_TAG})"}
 
     try:
         async with httpx.AsyncClient(timeout=12) as http_client:
@@ -339,24 +322,24 @@ async def fetch_onthisday_ru(d: date, use_cache: bool = True) -> Optional[str]:
 
         data = resp.json()
 
-        def _pick_items(arr: List[Dict[str, Any]], n: int, require_year: bool = False) -> List[Dict[str, Any]]:
-            items = arr or []
+        def _pick(arr: List[Dict[str, Any]], n: int, require_year: bool = False) -> List[Dict[str, Any]]:
+            items = list(arr or [])
             random.shuffle(items)
-            picked = []
+            out = []
             for it in items:
                 if require_year and "year" not in it:
                     continue
-                text = it.get("text") or ""
-                if not text:
+                txt = (it.get("text") or "").strip()
+                if not txt:
                     continue
-                picked.append(it)
-                if len(picked) >= n:
+                out.append(it)
+                if len(out) >= n:
                     break
-            return picked
+            return out
 
-        # Wikimedia "all" обычно содержит: events, births, deaths, holidays (может быть пусто)
-        holidays = _pick_items(data.get("holidays", []), n=2, require_year=False)
-        events = _pick_items(data.get("events", []), n=2, require_year=True)
+        # Увеличили количество пунктов (чтобы текст был длиннее)
+        holidays = _pick(data.get("holidays", []), n=4, require_year=False)
+        events = _pick(data.get("events", []), n=6, require_year=True)
 
         lines: List[str] = []
         title = f"📅 Сегодня ({dd}.{mm})"
@@ -364,11 +347,11 @@ async def fetch_onthisday_ru(d: date, use_cache: bool = True) -> Optional[str]:
         if holidays:
             lines.append("Праздники:")
             for h in holidays:
-                lines.append(f"• {h.get('text', '').strip()}")
+                lines.append(f"• {(h.get('text') or '').strip()}")
 
         if events:
             if holidays:
-                lines.append("")  # пустая строка-разделитель
+                lines.append("")
             lines.append("События:")
             for e in events:
                 y = e.get("year")
@@ -383,9 +366,8 @@ async def fetch_onthisday_ru(d: date, use_cache: bool = True) -> Optional[str]:
 
         text_out = title + "\n" + "\n".join(lines)
 
-        # Ограничим длину под Telegram (4096), оставим запас
-        if len(text_out) > 3500:
-            text_out = text_out[:3500].rsplit("\n", 1)[0] + "\n…"
+        # Умная обрезка под лимит Telegram
+        text_out = _smart_truncate(text_out, max_len=max_len)
 
         _onthisday_cache[key] = (text_out, now)
         return text_out
@@ -396,7 +378,6 @@ async def fetch_onthisday_ru(d: date, use_cache: bool = True) -> Optional[str]:
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /today — показать праздники и события на сегодня."""
     tz = get_tz()
     now = datetime.now(tz)
     text = await fetch_onthisday_ru(now.date())
@@ -406,53 +387,13 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def today_events_job(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневное сообщение 'что сегодня за день'."""
-    if not GROUP_CHAT_ID:
-        return
-
-    tz = get_tz()
-    now = datetime.now(tz)
-
-    logger.info(f"[Today events job] Called at {now}")
-
-    today_str = now.date().isoformat()
-    last_send_key = f"today_events_sent_{today_str}"
-
-    if last_send_key in _last_scheduled_sent_at:
-        logger.info(f"[Today events] Already sent today ({today_str}), skipping")
-        return
-
-    text = await fetch_onthisday_ru(now.date())
-    if not text:
-        logger.error("[Today events] Failed to fetch onthisday text")
-        return
-
-    # Дедуп на всякий случай
-    if _should_dedupe_scheduled_send("today_events_job", now, text):
-        logger.info("[Today events] DEDUP: skipping duplicate send")
-        return
-
-    try:
-        await context.bot.send_message(
-            chat_id=int(GROUP_CHAT_ID),
-            text=text,
-        )
-        _record_scheduled_send("today_events_job", now, text)
-        _last_scheduled_sent_at[last_send_key] = now
-        logger.info(f"[Today events] Sent at {now}")
-    except Exception as e:
-        logger.error(f"Error sending today events message: {e}")
-
-
-# ---------- AI MESSAGE GENERATORS ----------
+# ---------- AI GENERATORS ----------
 
 MAX_QA_TOKENS = 160
 MAX_MAXIM_REPLY_TOKENS = 70
 MAX_SCHEDULED_TOKENS = 90
 
 def get_time_context(hour: int) -> str:
-    """Генерирует контекстное описание времени для промптов."""
     if hour < 6:
         return "Ночь."
     elif hour < 12:
@@ -466,7 +407,6 @@ def get_time_context(hour: int) -> str:
 
 
 def build_samuil_system_prompt(include_maxim_context: bool = False) -> str:
-    """Создает системный промпт для Самуила."""
     base = (
         "Ты — Самуил, саркастичный, но в целом доброжелательный телеграм-бот.\n"
         "Говоришь по-русски, на 'ты'.\n"
@@ -475,7 +415,6 @@ def build_samuil_system_prompt(include_maxim_context: bool = False) -> str:
         "Эмодзи: редко, максимум 0–1.\n"
         "Избегай повторов формулировок.\n"
     )
-
     if not include_maxim_context:
         return base
 
@@ -493,23 +432,18 @@ def build_samuil_system_prompt(include_maxim_context: bool = False) -> str:
 
 
 def _normalize_text_for_dedupe(s: str) -> str:
-    """Нормализация текста для дедупликации."""
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
 def _should_dedupe_scheduled_send(job_name: str, now: datetime, text: str) -> bool:
-    """
-    Защита от дублей в рамках одного процесса.
-    """
     norm = _normalize_text_for_dedupe(text)
     if not norm:
         return False
 
     last_at = _last_scheduled_sent_at.get(job_name)
     if last_at is not None:
-        time_diff = abs((now - last_at).total_seconds())
-        if time_diff < 600:  # 10 минут
-            logger.info(f"Dedupe: too soon since last send ({time_diff:.0f}s)")
+        if abs((now - last_at).total_seconds()) < 600:
+            logger.info(f"Dedupe: too soon since last send for {job_name}")
             return True
 
     for prev in _last_scheduled_texts[job_name]:
@@ -521,9 +455,7 @@ def _should_dedupe_scheduled_send(job_name: str, now: datetime, text: str) -> bo
         if len(norm) > 20 and len(prev_norm) > 20:
             words_current = set(norm.split())
             words_prev = set(prev_norm.split())
-            common_words = words_current.intersection(words_prev)
-            similarity = len(common_words) / max(len(words_current), len(words_prev))
-
+            similarity = len(words_current & words_prev) / max(len(words_current), len(words_prev))
             if similarity > 0.8:
                 logger.info(f"Dedupe: high similarity ({similarity:.0%}) for {job_name}")
                 return True
@@ -532,18 +464,12 @@ def _should_dedupe_scheduled_send(job_name: str, now: datetime, text: str) -> bo
 
 
 def _record_scheduled_send(job_name: str, now: datetime, text: str) -> None:
-    """Запись факта отправки запланированного сообщения."""
     _last_scheduled_sent_at[job_name] = now
     _last_scheduled_texts[job_name].append(text)
-    logger.info(f"Recorded send for {job_name} at {now}")
 
 
 async def generate_sarcastic_reply_for_maxim(now: datetime, user_text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Генерация короткого саркастичного комментария на сообщение Максима."""
-    weekday_names = [
-        "понедельник", "вторник", "среда",
-        "четверг", "пятница", "суббота", "воскресенье",
-    ]
+    weekday_names = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
     weekday_name = weekday_names[now.weekday()]
     time_str = now.strftime("%H:%M")
     time_context = get_time_context(now.hour)
@@ -556,21 +482,15 @@ async def generate_sarcastic_reply_for_maxim(now: datetime, user_text: str) -> T
         f"Сообщение Максима: «{user_text}»\n\n"
         f"НЕ повторяй дословно последние ответы Самуила:\n{last_replies}\n\n"
         "Задание: придумай ОЧЕНЬ короткий ответ (одна фраза или 1–2 коротких предложения).\n"
-        "Без длинных вступлений. По возможности новая формулировка.\n"
+        "Без длинных вступлений.\n"
     )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}]
 
     text, err = await call_openai_chat(
-        messages,
-        max_tokens=MAX_MAXIM_REPLY_TOKENS,
-        temperature=0.95,
-        use_cache=False
+        messages, max_tokens=MAX_MAXIM_REPLY_TOKENS, temperature=0.95, use_cache=False
     )
-
     if text:
         _last_maxim_replies.append(text)
     return text, err
@@ -583,11 +503,7 @@ async def generate_samuil_answer(
     user_text: str,
     weather_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Ответ Самуила на прямое обращение."""
-    weekday_names = [
-        "понедельник", "вторник", "среда",
-        "четверг", "пятница", "суббота", "воскресенье",
-    ]
+    weekday_names = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
     weekday_name = weekday_names[now.weekday()]
     time_str = now.strftime("%H:%M")
 
@@ -601,50 +517,31 @@ async def generate_samuil_answer(
         f"Сегодня {weekday_name}. {time_context} Сейчас {time_str}.",
         "Ты в групповом чате. Отвечай коротко и по делу.",
     ]
-
     if weather_info is not None:
-        weather_str = format_weather_for_prompt(weather_info)
-        extra_context_parts.append(f"Точные данные о погоде (как факт): {weather_str}")
-
-    extra_context = " ".join(extra_context_parts)
+        extra_context_parts.append(f"Точные данные о погоде (как факт): {format_weather_for_prompt(weather_info)}")
 
     key = (chat_id, user_id)
     history = dialog_history[key]
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    messages.append({"role": "user", "content": extra_context})
+    messages.append({"role": "user", "content": " ".join(extra_context_parts)})
 
     if history:
-        trimmed = history[-4:]
-        messages.extend(trimmed)
+        messages.extend(history[-4:])
 
     messages.append({"role": "user", "content": user_text})
 
     if "?" in user_text:
-        messages.append({
-            "role": "system",
-            "content": "Если это вопрос — ответь информативно, но кратко (2–4 коротких предложения)."
-        })
+        messages.append({"role": "system", "content": "Если это вопрос — ответь кратко (2–4 предложения)."})
     else:
-        messages.append({
-            "role": "system",
-            "content": "Если это не вопрос — ответь короткой репликой (1–2 предложения)."
-        })
+        messages.append({"role": "system", "content": "Если это не вопрос — ответь коротко (1–2 предложения)."})
 
-    text, err = await call_openai_chat(
-        messages,
-        max_tokens=MAX_QA_TOKENS,
-        temperature=0.85,
-        use_cache=False
-    )
+    text, err = await call_openai_chat(messages, max_tokens=MAX_QA_TOKENS, temperature=0.85, use_cache=False)
 
     if text is not None:
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": text})
-        if len(history) > 20:
-            dialog_history[key] = history[-20:]
-        else:
-            dialog_history[key] = history
+        dialog_history[key] = history[-20:]
 
     return text, err
 
@@ -652,43 +549,33 @@ async def generate_samuil_answer(
 # ---------- COMMAND HANDLERS ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
     chat_type = update.effective_chat.type
     if chat_type == "private":
         await update.message.reply_text(
             "Привет! Я Самуил 🤖\n"
             "В группе иногда комментирую Максима, "
-            "а если написать 'Самуил' или ответить реплаем на моё сообщение — отвечу.\n"
-            "Погоду тоже могу подсказать. Картинки: /img <запрос>.\n"
-            "События дня: /today."
+            "а если написать 'Самуил' или ответить реплаем — отвечу.\n"
+            "Картинки: /img <запрос>. События дня: /today."
         )
     else:
         await update.message.reply_text(
-            "Я Самуил. Зови по имени (или реплаем) — отвечу. "
-            "Иногда подколю Максима. /img тоже работает. /today — что сегодня за день."
+            "Я Самуил. Зови по имени (или реплаем) — отвечу. /today — что сегодня за день."
         )
 
 
-async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает ID текущего чата."""
+async def chat_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    await update.message.reply_text(
-        f"Chat ID for this chat: `{cid}`",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(f"Chat ID for this chat: `{cid}`", parse_mode="Markdown")
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает информацию о пользователе."""
     user = update.effective_user
     await update.message.reply_text(
-        f"Your user ID: `{user.id}`\nUsername: @{user.username}",
-        parse_mode="Markdown",
+        f"Your user ID: `{user.id}`\nUsername: @{user.username}", parse_mode="Markdown"
     )
 
 
 async def echo_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Echo только в личке."""
     if update.effective_chat.type != "private":
         return
     text = update.message.text or ""
@@ -696,13 +583,9 @@ async def echo_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Команда /img <описание> – генерирует и отправляет картинку по текстовому запросу.
-    """
     if client is None:
         await update.message.reply_text("У меня не настроен OpenAI API, картинку сделать не могу.")
         return
-
     args = context.args
     if not args:
         await update.message.reply_text("Напиши запрос после команды, например: /img кот в космосе")
@@ -714,7 +597,6 @@ async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status_msg = await update.message.reply_text("🎨 Создаю картинку...")
-
     img_url, err = await generate_image_from_prompt(prompt)
     if img_url is None:
         logger.error(f"Image generation error: {err}")
@@ -733,63 +615,45 @@ async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Очистка истории диалога для пользователя."""
     key = (update.effective_chat.id, update.effective_user.id)
-    if key in dialog_history:
-        dialog_history[key] = []
-        await update.message.reply_text("История диалога очищена.")
-    else:
-        await update.message.reply_text("У тебя ещё нет истории диалога.")
+    dialog_history[key] = []
+    await update.message.reply_text("История диалога очищена.")
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает статистику бота."""
-    total_dialogs = len(dialog_history)
-    total_messages = sum(len(history) for history in dialog_history.values())
-    weather_cache_size = len(_weather_cache)
-    openai_cache_size = len(_openai_cache)
-    onthisday_cache_size = len(_onthisday_cache)
-
-    stats_text = (
-        f"📊 Статистика Самуила:\n"
-        f"• Активных диалогов: {total_dialogs}\n"
-        f"• Всего сообщений в истории: {total_messages}\n"
-        f"• Городов в кэше погоды: {weather_cache_size}\n"
-        f"• Ответов в кэше OpenAI: {openai_cache_size}\n"
-        f"• Кэш 'события дня': {onthisday_cache_size}\n"
-        f"• Последних ответов Максиму: {len(_last_maxim_replies)}"
+    await update.message.reply_text(
+        "📊 Статистика Самуила:\n"
+        f"• Активных диалогов: {len(dialog_history)}\n"
+        f"• Сообщений в истории: {sum(len(h) for h in dialog_history.values())}\n"
+        f"• Кэш погоды: {len(_weather_cache)}\n"
+        f"• Кэш OpenAI: {len(_openai_cache)}\n"
+        f"• Кэш /today: {len(_onthisday_cache)}\n"
+        f"• INSTANCE_TAG: {INSTANCE_TAG}"
     )
-
-    await update.message.reply_text(stats_text)
 
 
 # ---------- GROUP MESSAGE HANDLER ----------
 
 def _looks_like_image_request(text_lower: str) -> bool:
-    """Эвристика: обращение к Самуилу с просьбой про картинку."""
     keywords = ["картинк", "фото", "фотку", "гиф", "gif", "мем", "picture", "image"]
     verbs = ["сделай", "нарисуй", "найди", "покажи", "придумай"]
     return any(k in text_lower for k in keywords) and any(v in text_lower for v in verbs)
 
 
 def _clean_prompt_for_image(text: str) -> str:
-    """Убираем служебные слова, оставляем описание."""
     patterns = [
         (r"\bсамуил\b", ""),
         (r"(сделай|нарисуй|найди|покажи|придумай)( мне)?\s+(картинку|мем|гифку|фото)", ""),
         (r"пожалуйста\b", ""),
         (r"\s+", " "),
     ]
-
     result = text.strip()
     for pattern, replacement in patterns:
         result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
-
     return result.strip() or "саркастичный мем про одинокого взрослого мужчину по имени Максим"
 
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик сообщений в группе."""
     message = update.message
     if message is None or message.text is None:
         return
@@ -801,12 +665,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id_val = chat.id
     user_id = user.id
 
-    logger.info(f"Group message: chat={chat_id_val} user={user_id} ({user.username}) text='{text[:50]}...'")
-
+    # Если задан конкретный GROUP_CHAT_ID — работаем только там
     if GROUP_CHAT_ID:
         try:
-            target_chat_id = int(GROUP_CHAT_ID)
-            if chat_id_val != target_chat_id:
+            if chat_id_val != int(GROUP_CHAT_ID):
                 return
         except ValueError:
             pass
@@ -828,30 +690,21 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 1) Прямое общение с Самуилом
     if is_reply_to_bot or ("самуил" in text_lower):
+        # Картинка по эвристике
         if _looks_like_image_request(text_lower) and client is not None:
             prompt = _clean_prompt_for_image(text)
-
             status_msg = await message.chat.send_message("🎨 Создаю картинку...")
-
             img_url, err = await generate_image_from_prompt(prompt)
             if img_url is None:
-                logger.error(f"Image generation error (dialog): {err}")
                 await status_msg.edit_text("Не вышло. Попробуй ещё раз, но попроще.")
                 return
-
-            try:
-                await status_msg.delete()
-                await message.chat.send_photo(
-                    photo=img_url,
-                    caption=f"🎨 {prompt[:100]}{'...' if len(prompt) > 100 else ''}",
-                )
-            except Exception as e:
-                logger.error(f"Error sending image (dialog): {e}")
-                await message.chat.send_message("Картинка есть, а отправить не смог.")
+            await status_msg.delete()
+            await message.chat.send_photo(photo=img_url, caption=f"🎨 {prompt[:100]}")
             return
 
+        # Погода только если явно спрашивают
         weather_info = None
-        if any(keyword in text_lower for keyword in ["погод", "температур", "жара", "холод", "дождь"]):
+        if any(k in text_lower for k in ["погод", "температур", "жара", "холод", "дождь"]):
             city_query = detect_weather_city_from_text(text)
             if city_query:
                 weather_info = await fetch_weather_for_city(city_query)
@@ -865,14 +718,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         if ai_text is None:
-            fallbacks = [
-                "Я завис. Спроси ещё раз попроще.",
-                "Сегодня я в эконом-режиме. Попробуй позже.",
-                "Мой сарказм ушёл пить чай. Вернусь.",
-                "Перефразируй — я не телепат.",
-            ]
-            logger.error(f"OpenAI error for Samuil Q&A: {err}")
-            await message.chat.send_message(random.choice(fallbacks))
+            await message.chat.send_message("Я завис. Спроси ещё раз попроще.")
             return
 
         await message.chat.send_message(ai_text)
@@ -881,25 +727,14 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # 2) Саркастический комментарий на сообщения Максима
     if TARGET_USER_ID and user_id == TARGET_USER_ID:
         if random.random() < 0.40:
-            logger.debug("Skipping Maxim's message for variety")
             return
-
         if len(text) < 3:
             return
 
         ai_text, err = await generate_sarcastic_reply_for_maxim(now=now, user_text=text)
-
         if ai_text is None:
-            fallbacks = [
-                "Максим, это было смело. И странно.",
-                "Понял. Записал. Осудил.",
-                "Сильная мысль. Почти.",
-                "Я бы ответил… но ты справишься сам.",
-            ]
-            logger.error(f"OpenAI error for sarcastic_reply: {err}")
-            await message.chat.send_message(random.choice(fallbacks))
+            await message.chat.send_message("Понял. Записал. Осудил.")
             return
-
         await message.chat.send_message(ai_text)
         return
 
@@ -907,270 +742,202 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 # ---------- SCHEDULED JOBS ----------
 
 async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
-    """Утреннее сообщение в 07:30."""
     if not GROUP_CHAT_ID:
         return
-
     tz = get_tz()
     now = datetime.now(tz)
 
-    logger.info(f"[Good morning job] Called at {now}")
-
     today_str = now.date().isoformat()
-    last_send_key = f"good_morning_sent_{today_str}"
-
-    if last_send_key in _last_scheduled_sent_at:
-        logger.info(f"[Good morning] Already sent today ({today_str}), skipping")
+    flag = f"good_morning_sent_{today_str}"
+    if flag in _sent_day_flags:
         return
 
-    weekday_names = [
-        "понедельник", "вторник", "среда",
-        "четверг", "пятница", "суббота", "воскресенье",
-    ]
-    weekday_name = weekday_names[now.weekday()]
-
     system_prompt = build_samuil_system_prompt(include_maxim_context=True)
-
-    recent = "\n".join(f"- {x}" for x in list(_last_scheduled_texts["good_morning_job"])) or "- (нет)"
-    user_prompt = (
-        f"Сегодня {weekday_name}. Утро, 07:30.\n"
-        "Сделай ОЧЕНЬ короткое утреннее сообщение Максиму: 1 фраза или 1 короткое предложение.\n"
-        "Без длинных вступлений.\n"
-        f"Не повторяй последние варианты:\n{recent}\n"
-    )
-
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": "Сделай ОЧЕНЬ короткое утреннее сообщение Максиму: 1 фраза."}
     ]
-
-    text, err = await call_openai_chat(
-        messages,
-        max_tokens=MAX_SCHEDULED_TOKENS,
-        temperature=0.95,
-        use_cache=False
-    )
-
-    if text is None:
-        logger.error(f"OpenAI error for good morning: {err}")
+    text, err = await call_openai_chat(messages, max_tokens=MAX_SCHEDULED_TOKENS, temperature=0.95, use_cache=False)
+    if not text:
         return
 
     if _should_dedupe_scheduled_send("good_morning_job", now, text):
-        logger.info("[Good morning] DEDUP: skipping duplicate send")
         return
 
-    try:
-        await context.bot.send_message(
-            chat_id=int(GROUP_CHAT_ID),
-            text=text,
-        )
-        _record_scheduled_send("good_morning_job", now, text)
-        _last_scheduled_sent_at[last_send_key] = now
-        logger.info(f"[Good morning] Sent at {now}")
-    except Exception as e:
-        logger.error(f"Error sending good morning message: {e}")
+    await context.bot.send_message(chat_id=int(GROUP_CHAT_ID), text=text)
+    _record_scheduled_send("good_morning_job", now, text)
+    _sent_day_flags[flag] = now
 
 
-async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
-    """Вечернее сообщение в 21:00."""
+async def today_events_job(context: ContextTypes.DEFAULT_TYPE):
     if not GROUP_CHAT_ID:
         return
-
     tz = get_tz()
     now = datetime.now(tz)
 
-    logger.info(f"[Evening summary job] Called at {now}")
+    today_str = now.date().isoformat()
+    flag = f"today_events_sent_{today_str}"
+    if flag in _sent_day_flags:
+        return
+
+    text = await fetch_onthisday_ru(now.date(), max_len=3900)
+    if not text:
+        return
+
+    if _should_dedupe_scheduled_send("today_events_job", now, text):
+        return
+
+    await context.bot.send_message(chat_id=int(GROUP_CHAT_ID), text=text)
+    _record_scheduled_send("today_events_job", now, text)
+    _sent_day_flags[flag] = now
+
+
+async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    if not GROUP_CHAT_ID:
+        return
+    tz = get_tz()
+    now = datetime.now(tz)
 
     today_str = now.date().isoformat()
-    last_send_key = f"evening_summary_sent_{today_str}"
-
-    if last_send_key in _last_scheduled_sent_at:
-        logger.info(f"[Evening summary] Already sent today ({today_str}), skipping")
+    flag = f"evening_summary_sent_{today_str}"
+    if flag in _sent_day_flags:
         return
 
     messages_today = daily_summary_log.get(today_str, [])
 
-    weekday_names = [
-        "понедельник", "вторник", "среда",
-        "четверг", "пятница", "суббота", "воскресенье",
-    ]
-    weekday_name = weekday_names[now.weekday()]
-
-    unique_messages = []
-    seen_authors = set()
-    for msg in reversed(messages_today[-12:]):
-        author = msg.split(":", 1)[0] if ":" in msg else "unknown"
-        if author not in seen_authors:
-            unique_messages.append(msg)
-            seen_authors.add(author)
-
-    if unique_messages:
-        joined = "\n".join(unique_messages[-6:])
-        context_msg = f"Из сегодняшних сообщений:\n{joined}\n"
-    else:
-        context_msg = "Сегодня в чате тихо.\n"
-
     system_prompt = build_samuil_system_prompt(include_maxim_context=True)
-
-    recent = "\n".join(f"- {x}" for x in list(_last_scheduled_texts["evening_summary_job"])) or "- (нет)"
-    user_prompt = (
-        f"Сегодня {weekday_name}, 21:00.\n"
-        f"{context_msg}\n"
-        "Сделай одно сообщение: 1–2 коротких предложения: мини-итог + спокойной ночи Максиму.\n"
-        f"Не повторяй последние варианты:\n{recent}\n"
-    )
-
+    context_msg = "Сегодня в чате тихо.\n" if not messages_today else "Короткий итог дня."
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": f"{context_msg}\nСделай 1–2 предложения: мини-итог + спокойной ночи Максиму."}
     ]
-
-    text, err = await call_openai_chat(
-        messages,
-        max_tokens=MAX_SCHEDULED_TOKENS,
-        temperature=0.95,
-        use_cache=False
-    )
-
-    if text is None:
-        logger.error(f"OpenAI error for evening summary: {err}")
+    text, err = await call_openai_chat(messages, max_tokens=MAX_SCHEDULED_TOKENS, temperature=0.95, use_cache=False)
+    if not text:
         return
 
     if _should_dedupe_scheduled_send("evening_summary_job", now, text):
-        logger.info("[Evening summary] DEDUP: skipping duplicate send")
         return
 
-    try:
-        await context.bot.send_message(
-            chat_id=int(GROUP_CHAT_ID),
-            text=text,
-        )
-        _record_scheduled_send("evening_summary_job", now, text)
-        _last_scheduled_sent_at[last_send_key] = now
-        logger.info(f"[Evening summary] Sent at {now}")
-
-        if today_str in daily_summary_log:
-            del daily_summary_log[today_str]
-
-    except Exception as e:
-        logger.error(f"Error sending evening summary message: {e}")
+    await context.bot.send_message(chat_id=int(GROUP_CHAT_ID), text=text)
+    _record_scheduled_send("evening_summary_job", now, text)
+    _sent_day_flags[flag] = now
+    daily_summary_log.pop(today_str, None)
 
 
 # ---------- JOB SCHEDULING MANAGEMENT ----------
 
 class JobManager:
-    """Менеджер для управления запланированными задачами."""
+    """
+    Менеджер для управления запланированными задачами.
+    Lock защищает от двойного вызова setup_jobs в одном процессе.
+    """
+    JOB_MORNING_NAME = "samuil_good_morning"
+    JOB_TODAY_NAME = "samuil_today_events"
+    JOB_EVENING_NAME = "samuil_evening_summary"
 
     def __init__(self):
         self.jobs_setup = False
         self.setup_time = None
-        self.job_names = set()
+        self._lock = asyncio.Lock()
+        self._startup_sent = False
+
+    async def _remove_jobs_by_name(self, job_queue, name: str):
+        """Удаляем все jobs с конкретным именем (если накопились)."""
+        try:
+            jobs = job_queue.get_jobs_by_name(name)
+        except Exception:
+            jobs = [j for j in job_queue.jobs() if getattr(j, "name", None) == name]
+
+        for j in jobs:
+            try:
+                j.schedule_removal()
+                logger.info(f"Removed old job by name: {name}")
+            except Exception as e:
+                logger.error(f"Error removing job {name}: {e}")
 
     async def setup_jobs(self, application: Application):
-        """Настройка запланированных задач с защитой от дублей."""
-        if self.jobs_setup:
-            logger.info("Jobs already set up, skipping...")
-            return
+        async with self._lock:
+            if self.jobs_setup:
+                logger.info("Jobs already set up, skipping...")
+                return
 
-        job_queue = application.job_queue
-        if not job_queue:
-            logger.error("No job queue available!")
-            return
+            job_queue = application.job_queue
+            if not job_queue:
+                logger.error("No job queue available!")
+                return
 
-        tz = get_tz()
-        now = datetime.now(tz)
+            tz = get_tz()
+            now = datetime.now(tz)
 
-        # ОЧЕНЬ ВАЖНО: очищаем ВСЕ старые задачи Самуила
-        existing_jobs = list(job_queue.jobs())
-        jobs_to_remove = []
+            # Удаляем старые по фиксированным именам
+            await self._remove_jobs_by_name(job_queue, self.JOB_MORNING_NAME)
+            await self._remove_jobs_by_name(job_queue, self.JOB_TODAY_NAME)
+            await self._remove_jobs_by_name(job_queue, self.JOB_EVENING_NAME)
 
-        for job in existing_jobs:
-            if hasattr(job.callback, '__name__'):
-                if job.callback.__name__ in ['good_morning_job', 'evening_summary_job', 'today_events_job']:
-                    jobs_to_remove.append(job)
+            await asyncio.sleep(0.5)
 
-        for job in jobs_to_remove:
-            try:
-                job.schedule_removal()
-                logger.info(f"Removed old job: {job.name}")
-            except Exception as e:
-                logger.error(f"Error removing job {job.name}: {e}")
+            # --- ВОТ ГДЕ МЕНЯЕТСЯ ВРЕМЯ ---
+            job_queue.run_daily(
+                good_morning_job,
+                time=time(7, 30, tzinfo=tz),
+                name=self.JOB_MORNING_NAME,
+            )
+            job_queue.run_daily(
+                today_events_job,
+                time=time(9, 0, tzinfo=tz),
+                name=self.JOB_TODAY_NAME,
+            )
+            job_queue.run_daily(
+                evening_summary_job,
+                time=time(21, 0, tzinfo=tz),
+                name=self.JOB_EVENING_NAME,
+            )
+            # --------------------------------
 
-        await asyncio.sleep(1)
+            self.jobs_setup = True
+            self.setup_time = now
 
-        morning_job = job_queue.run_daily(
-            good_morning_job,
-            time=time(7, 30, tzinfo=tz),
-            name=f"samuil_good_morning_{int(now.timestamp())}",
-        )
+            logger.info(f"Jobs scheduled at {now} [{TIMEZONE}] instance={INSTANCE_TAG}")
 
-        # Новое: события/праздники на сегодня (09:00)
-        today_job = job_queue.run_daily(
-            today_events_job,
-            time=time(15, 5, tzinfo=tz),
-            name=f"samuil_today_events_{int(now.timestamp())}",
-        )
+            # Сбрасываем дедуп-истории на старте (в рамках одного процесса)
+            _last_scheduled_sent_at.clear()
+            _last_scheduled_texts.clear()
 
-        evening_job = job_queue.run_daily(
-            evening_summary_job,
-            time=time(21, 0, tzinfo=tz),
-            name=f"samuil_evening_summary_{int(now.timestamp())}",
-        )
+            # Startup message: защита от двойной отправки в одном процессе
+            if GROUP_CHAT_ID and not self._startup_sent:
+                try:
+                    await asyncio.sleep(2)
+                    key = "startup_sent_guard"
+                    last = _last_scheduled_sent_at.get(key)
+                    if last and abs((datetime.now(tz) - last).total_seconds()) < 60:
+                        return
 
-        if morning_job:
-            self.job_names.add(morning_job.name)
-        if today_job:
-            self.job_names.add(today_job.name)
-        if evening_job:
-            self.job_names.add(evening_job.name)
-
-        self.jobs_setup = True
-        self.setup_time = now
-
-        logger.info(f"Jobs scheduled at {now} [{TIMEZONE}]")
-        logger.info(f"Morning job: {morning_job.name if morning_job else 'failed'}")
-        logger.info(f"Today events job: {today_job.name if today_job else 'failed'}")
-        logger.info(f"Evening job: {evening_job.name if evening_job else 'failed'}")
-
-        global _last_scheduled_sent_at, _last_scheduled_texts
-        _last_scheduled_sent_at.clear()
-        _last_scheduled_texts.clear()
-
-        if GROUP_CHAT_ID:
-            try:
-                await asyncio.sleep(5)
-                if datetime.now(tz).timestamp() - now.timestamp() < 30:
                     startup_texts = [
-                        "Самуил в сети. Режим наблюдения.",
-                        "Система активна. Все датчики в норме.",
-                        "Бот запущен. Приступаю к мониторингу.",
+                        f"Самуил в сети. Режим наблюдения. [{INSTANCE_TAG}]",
+                        f"Система активна. Все датчики в норме. [{INSTANCE_TAG}]",
+                        f"Бот запущен. Приступаю к мониторингу. [{INSTANCE_TAG}]",
                     ]
-
                     await application.bot.send_message(
                         chat_id=int(GROUP_CHAT_ID),
-                        text=random.choice(startup_texts)
+                        text=random.choice(startup_texts),
                     )
-                    logger.info("Startup message sent.")
-            except Exception as e:
-                logger.error(f"Error sending startup message: {e}")
+                    _last_scheduled_sent_at[key] = datetime.now(tz)
+                    self._startup_sent = True
+                except Exception as e:
+                    logger.error(f"Error sending startup message: {e}")
 
-# Создаем глобальный менеджер задач
+
 job_manager = JobManager()
 
 
 # ---------- ERROR HANDLING ----------
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный обработчик ошибок."""
     logger.error(f"Exception while handling an update: {context.error}")
-
     if ADMIN_CHAT_ID:
         try:
-            error_msg = f"❌ Ошибка в боте:\n{type(context.error).__name__}: {context.error}"
-            await context.bot.send_message(
-                chat_id=int(ADMIN_CHAT_ID),
-                text=error_msg[:4000]
-            )
+            error_msg = f"❌ Ошибка в боте [{INSTANCE_TAG}]:\n{type(context.error).__name__}: {context.error}"
+            await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=error_msg[:4000])
         except Exception as e:
             logger.error(f"Failed to send error to admin: {e}")
 
@@ -1178,61 +945,47 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- MAIN APP ----------
 
 def main():
-    """Основная функция запуска бота."""
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in environment variables!")
 
-    global _last_scheduled_sent_at, _last_scheduled_texts
     _last_scheduled_sent_at.clear()
     _last_scheduled_texts.clear()
+    _sent_day_flags.clear()
 
     app = Application.builder().token(TOKEN).build()
-
     app.add_error_handler(error_handler)
 
     # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("chatid", chat_id))
+    app.add_handler(CommandHandler("chatid", chat_id_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("img", cmd_image))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("stats", cmd_stats))
-
-    # Новое: /today
     app.add_handler(CommandHandler("today", cmd_today))
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-            echo_private,
-        )
-    )
+    # Echo только в личке
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, echo_private))
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
-            handle_group_message,
-        )
-    )
+    # Сообщения в группах
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, handle_group_message))
 
     async def post_init(application: Application):
-        """Функция, вызываемая после инициализации бота."""
-        logger.info("Bot initialized, setting up jobs...")
+        logger.info(f"Bot initialized, setting up jobs... instance={INSTANCE_TAG}")
         await job_manager.setup_jobs(application)
-        logger.info("Bot is ready!")
+        logger.info(f"Bot is ready! instance={INSTANCE_TAG}")
 
     app.post_init = post_init
 
     async def shutdown(application: Application):
-        """Функция для корректного завершения работы."""
-        logger.info("Shutting down bot...")
+        logger.info(f"Shutting down bot... instance={INSTANCE_TAG}")
         if client:
             await client.close()
         logger.info("Bot shutdown complete.")
 
     app.post_shutdown = shutdown
 
-    logger.info("Bot starting...")
+    logger.info(f"Bot starting... instance={INSTANCE_TAG}")
 
     app.run_polling(
         drop_pending_updates=True,
