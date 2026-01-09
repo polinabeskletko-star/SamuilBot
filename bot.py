@@ -884,7 +884,7 @@ class JobManager:
             )
             job_queue.run_daily(
                 today_events_job,
-                time=time(15, 25, tzinfo=tz),
+                time=time(15, 35, tzinfo=tz),
                 name=self.JOB_TODAY_NAME,
             )
             job_queue.run_daily(
