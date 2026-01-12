@@ -72,8 +72,12 @@ WEATHER_CACHE_TTL = 300  # 5 минут
 _openai_cache: Dict[str, Tuple[str, datetime]] = {}
 OPENAI_CACHE_TTL = 600  # 10 минут
 
+# /today output cache (готовый текст)
 _onthisday_cache: Dict[str, Tuple[str, datetime]] = {}
 ONTHISDAY_CACHE_TTL = 6 * 3600  # 6 часов
+
+# onthisday structured cache (список праздников/событий)
+_onthisday_struct_cache: Dict[str, Tuple[Dict[str, Any], datetime]] = {}
 
 # флаги "отправлено сегодня" для scheduled (в рамках процесса)
 _sent_day_flags: Dict[str, datetime] = {}
@@ -292,20 +296,20 @@ def _smart_truncate(text: str, max_len: int = 3900) -> str:
     return cut.rstrip() + "\n…"
 
 
-async def fetch_onthisday_ru(d: date, use_cache: bool = True, max_len: int = 3900) -> Optional[str]:
+async def fetch_onthisday_struct_ru(d: date, use_cache: bool = True) -> Optional[Dict[str, Any]]:
     """
-    Берём праздники/события "в этот день" из Wikimedia API (ru).
-    Возвращаем готовый текст для Telegram, с безопасной длиной и аккуратной обрезкой.
+    Тянем структурированные данные 'в этот день' (ru) и выбираем
+    небольшую выборку праздников и событий.
     """
     key = d.isoformat()
     now = datetime.now()
 
     if use_cache:
-        cached = _onthisday_cache.get(key)
+        cached = _onthisday_struct_cache.get(key)
         if cached:
-            text, ts = cached
+            data, ts = cached
             if (now - ts).total_seconds() < ONTHISDAY_CACHE_TTL:
-                return text
+                return data
 
     mm = f"{d.month:02d}"
     dd = f"{d.day:02d}"
@@ -320,7 +324,7 @@ async def fetch_onthisday_ru(d: date, use_cache: bool = True, max_len: int = 390
             logger.error(f"OnThisDay API error: {resp.status_code} {resp.text[:200]}")
             return None
 
-        data = resp.json()
+        raw = resp.json()
 
         def _pick(arr: List[Dict[str, Any]], n: int, require_year: bool = False) -> List[Dict[str, Any]]:
             items = list(arr or [])
@@ -332,49 +336,82 @@ async def fetch_onthisday_ru(d: date, use_cache: bool = True, max_len: int = 390
                 txt = (it.get("text") or "").strip()
                 if not txt:
                     continue
+                # лёгкая фильтрация очень длинных пунктов
+                if len(txt) > 240:
+                    continue
                 out.append(it)
                 if len(out) >= n:
                     break
             return out
 
-        # Увеличили количество пунктов (чтобы текст был длиннее)
-        holidays = _pick(data.get("holidays", []), n=4, require_year=False)
-        events = _pick(data.get("events", []), n=6, require_year=True)
+        # Для "повода" лучше меньше, но сочнее
+        holidays = _pick(raw.get("holidays", []), n=3, require_year=False)
+        events = _pick(raw.get("events", []), n=5, require_year=True)
 
-        lines: List[str] = []
-        title = f"📅 Сегодня ({dd}.{mm})"
+        data_out = {
+            "date": f"{dd}.{mm}",
+            "holidays": [{"text": (h.get("text") or "").strip()} for h in holidays],
+            "events": [{"year": e.get("year"), "text": (e.get("text") or "").strip()} for e in events],
+        }
 
-        if holidays:
-            lines.append("Праздники:")
-            for h in holidays:
-                lines.append(f"• {(h.get('text') or '').strip()}")
-
-        if events:
-            if holidays:
-                lines.append("")
-            lines.append("События:")
-            for e in events:
-                y = e.get("year")
-                t = (e.get("text") or "").strip()
-                if y and t:
-                    lines.append(f"• {y}: {t}")
-                elif t:
-                    lines.append(f"• {t}")
-
-        if not holidays and not events:
-            lines.append("Сегодня без ярких пунктов по базе. Значит, можно придумать свой повод 🙂")
-
-        text_out = title + "\n" + "\n".join(lines)
-
-        # Умная обрезка под лимит Telegram
-        text_out = _smart_truncate(text_out, max_len=max_len)
-
-        _onthisday_cache[key] = (text_out, now)
-        return text_out
+        _onthisday_struct_cache[key] = (data_out, now)
+        return data_out
 
     except Exception as e:
-        logger.error(f"Error fetching onthisday: {e}")
+        logger.error(f"Error fetching onthisday struct: {e}")
         return None
+
+
+async def fetch_onthisday_ru(d: date, use_cache: bool = True, max_len: int = 3900) -> Optional[str]:
+    """
+    Старый /today: праздники+события списком.
+    """
+    key = d.isoformat()
+    now = datetime.now()
+
+    if use_cache:
+        cached = _onthisday_cache.get(key)
+        if cached:
+            text, ts = cached
+            if (now - ts).total_seconds() < ONTHISDAY_CACHE_TTL:
+                return text
+
+    data = await fetch_onthisday_struct_ru(d, use_cache=use_cache)
+    if not data:
+        return None
+
+    ddmm = data["date"]
+    holidays = data.get("holidays", [])
+    events = data.get("events", [])
+
+    lines: List[str] = []
+    title = f"📅 Сегодня ({ddmm})"
+
+    if holidays:
+        lines.append("Праздники:")
+        for h in holidays:
+            lines.append(f"• {h.get('text','').strip()}")
+
+    if events:
+        if holidays:
+            lines.append("")
+        lines.append("События:")
+        for e in events[:6]:
+            y = e.get("year")
+            t = (e.get("text") or "").strip()
+            if y and t:
+                lines.append(f"• {y}: {t}")
+            elif t:
+                lines.append(f"• {t}")
+
+    if not holidays and not events:
+        lines.append("Сегодня без ярких пунктов по базе. Значит, можно придумать свой повод 🙂")
+
+    text_out = title + "\n" + "\n".join(lines)
+    text_out = _smart_truncate(text_out, max_len=max_len)
+
+    _onthisday_cache[key] = (text_out, now)
+    return text_out
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,6 +422,99 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не смог достать события на сегодня. Попробуй позже.")
         return
     await update.message.reply_text(text)
+
+
+# ---------- NEW: "ПОВОД ПОДНЯТЬ БОКАЛ" ----------
+
+MAX_TOAST_TOKENS = 220  # чтобы не обрезало посередине
+
+def _format_items_for_prompt(data: Dict[str, Any]) -> str:
+    ddmm = data.get("date", "")
+    holidays = data.get("holidays", [])
+    events = data.get("events", [])
+
+    # Соберём 2-4 пункта всего
+    pool: List[str] = []
+    for h in holidays:
+        t = (h.get("text") or "").strip()
+        if t:
+            pool.append(f"Праздник: {t}")
+
+    for e in events:
+        y = e.get("year")
+        t = (e.get("text") or "").strip()
+        if t and y:
+            pool.append(f"Событие: {y} — {t}")
+        elif t:
+            pool.append(f"Событие: {t}")
+
+    random.shuffle(pool)
+    chosen = pool[:4] if len(pool) >= 4 else pool[:max(2, len(pool))]
+
+    # fallback если пусто
+    if not chosen:
+        chosen = ["Сегодня база скучает. Придумай повод сам."]
+
+    joined = "\n".join(f"- {x}" for x in chosen)
+    return f"Дата: {ddmm}\nФакты дня:\n{joined}"
+
+
+async def generate_toast_from_onthisday(now: datetime) -> Optional[str]:
+    """
+    Делает короткий "повод поднять бокал (или чай)" в стиле Самуила.
+    Важно: без прямого призыва к злоупотреблению — лёгкая шутка и альтернатива без алкоголя.
+    """
+    data = await fetch_onthisday_struct_ru(now.date(), use_cache=True)
+    if not data:
+        return None
+
+    system_prompt = (
+        "Ты — Самуил, саркастичный, но доброжелательный телеграм-бот.\n"
+        "Говоришь по-русски, на 'ты'.\n"
+        "Ироничный, остроумный, НЕ грубый.\n"
+        "Эмодзи: максимум 1.\n"
+        "Пиши коротко, без длинных вступлений.\n"
+        "Тема: «повод поднять бокал» по событиям дня.\n"
+        "ВАЖНО: не поощряй ежедневное пьянство. Формулируй как «поднять бокал (или чай/безалк)», добавь мягкое «без фанатизма».\n"
+    )
+
+    facts = _format_items_for_prompt(data)
+
+    user_prompt = (
+        f"{facts}\n\n"
+        "Задание:\n"
+        "1) Выбери 2–3 самых забавных/контрастных пункта из фактов.\n"
+        "2) Сформулируй «Повод дня» в 4–7 строк, как сообщение в чате.\n"
+        "3) Структура:\n"
+        "   - Заголовок: «🍷 Повод дня (или чай)»\n"
+        "   - 2–3 буллета с фактами, перефразированными смешно и лаконично\n"
+        "   - 1 короткая финальная фраза-ирония\n"
+        "   - В конце: «без фанатизма» или «можно безалк» (1 раз)\n"
+        "4) Не выдумывай факты, опирайся только на данные выше.\n"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    text, err = await call_openai_chat(
+        messages, max_tokens=MAX_TOAST_TOKENS, temperature=0.95, use_cache=False
+    )
+    if not text:
+        return None
+
+    return _smart_truncate(text.strip(), max_len=3600)
+
+
+async def cmd_toast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tz = get_tz()
+    now = datetime.now(tz)
+    toast = await generate_toast_from_onthisday(now)
+    if not toast:
+        await update.message.reply_text("Сегодня повод не нашёлся. Значит, ты живёшь правильно.")
+        return
+    await update.message.reply_text(toast)
 
 
 # ---------- AI GENERATORS ----------
@@ -555,11 +685,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Привет! Я Самуил 🤖\n"
             "В группе иногда комментирую Максима, "
             "а если написать 'Самуил' или ответить реплаем — отвечу.\n"
-            "Картинки: /img <запрос>. События дня: /today."
+            "Картинки: /img <запрос>. События дня: /today. Повод дня: /toast."
         )
     else:
         await update.message.reply_text(
-            "Я Самуил. Зови по имени (или реплаем) — отвечу. /today — что сегодня за день."
+            "Я Самуил. Зови по имени (или реплаем) — отвечу. /today — что сегодня за день. /toast — повод дня."
         )
 
 
@@ -628,6 +758,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Кэш погоды: {len(_weather_cache)}\n"
         f"• Кэш OpenAI: {len(_openai_cache)}\n"
         f"• Кэш /today: {len(_onthisday_cache)}\n"
+        f"• Кэш /today struct: {len(_onthisday_struct_cache)}\n"
         f"• INSTANCE_TAG: {INSTANCE_TAG}"
     )
 
@@ -769,26 +900,32 @@ async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
     _sent_day_flags[flag] = now
 
 
-async def today_events_job(context: ContextTypes.DEFAULT_TYPE):
+async def today_toast_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Время 'событий дня', но вместо простого списка — повод поднять бокал (или чай).
+    """
     if not GROUP_CHAT_ID:
         return
     tz = get_tz()
     now = datetime.now(tz)
 
     today_str = now.date().isoformat()
-    flag = f"today_events_sent_{today_str}"
+    flag = f"today_toast_sent_{today_str}"
     if flag in _sent_day_flags:
         return
 
-    text = await fetch_onthisday_ru(now.date(), max_len=3900)
-    if not text:
+    toast = await generate_toast_from_onthisday(now)
+    if not toast:
+        # мягкий фолбэк
+        mm = f"{now.month:02d}"
+        dd = f"{now.day:02d}"
+        toast = f"🍷 Повод дня (или чай)\n• Сегодня {dd}.{mm}\n• Повод простой: день всё ещё не развалился.\nФинал: можно безалк."
+
+    if _should_dedupe_scheduled_send("today_toast_job", now, toast):
         return
 
-    if _should_dedupe_scheduled_send("today_events_job", now, text):
-        return
-
-    await context.bot.send_message(chat_id=int(GROUP_CHAT_ID), text=text)
-    _record_scheduled_send("today_events_job", now, text)
+    await context.bot.send_message(chat_id=int(GROUP_CHAT_ID), text=toast)
+    _record_scheduled_send("today_toast_job", now, toast)
     _sent_day_flags[flag] = now
 
 
@@ -832,7 +969,7 @@ class JobManager:
     Lock защищает от двойного вызова setup_jobs в одном процессе.
     """
     JOB_MORNING_NAME = "samuil_good_morning"
-    JOB_TODAY_NAME = "samuil_today_events"
+    JOB_TODAY_TOAST_NAME = "samuil_today_toast"
     JOB_EVENING_NAME = "samuil_evening_summary"
 
     def __init__(self):
@@ -871,7 +1008,7 @@ class JobManager:
 
             # Удаляем старые по фиксированным именам
             await self._remove_jobs_by_name(job_queue, self.JOB_MORNING_NAME)
-            await self._remove_jobs_by_name(job_queue, self.JOB_TODAY_NAME)
+            await self._remove_jobs_by_name(job_queue, self.JOB_TODAY_TOAST_NAME)
             await self._remove_jobs_by_name(job_queue, self.JOB_EVENING_NAME)
 
             await asyncio.sleep(0.5)
@@ -883,9 +1020,9 @@ class JobManager:
                 name=self.JOB_MORNING_NAME,
             )
             job_queue.run_daily(
-                today_events_job,
-                time=time(15, 55, tzinfo=tz),
-                name=self.JOB_TODAY_NAME,
+                today_toast_job,
+                time=time(16, 15, tzinfo=tz),
+                name=self.JOB_TODAY_TOAST_NAME,
             )
             job_queue.run_daily(
                 evening_summary_job,
@@ -963,6 +1100,7 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("toast", cmd_toast))
 
     # Echo только в личке
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, echo_private))
